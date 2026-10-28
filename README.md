@@ -1,5 +1,7 @@
 # claude-pool
 
+How is works: https://claude.ai/artifact/VetSRGMidBzwsyreSXuiEp
+
 See what every Claude Code session costs on your Mac, and close what nobody is using.
 
 If you run several Claude Code sessions at once, it's hard to tell which ones are busy, how much memory they're
