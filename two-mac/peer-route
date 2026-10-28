@@ -1,0 +1,48 @@
+#!/bin/sh
+# ssh ProxyCommand to the other Mac: over the Thunderbolt cable when it's plugged in, else the LAN, else Tailscale.
+# Usage: peer-route <bonjour name> <port>. The cable's only peer is the other Mac, so any address ARP has
+# learned on bridge0 is it, and ssh still checks the host key (HostKeyAlias) whichever address answers.
+name="$1"
+port="${2:-22}"
+cache="$HOME/.cache/peer-route-$name"
+
+try() {
+  [ -n "$1" ] && nc -z -G 1 "$1" "$port" 2>/dev/null || return 1
+  [ "$2" = tb ] && { mkdir -p "$(dirname "$cache")"; echo "$1" > "$cache"; }
+  exec nc "$1" "$port"
+}
+
+# A cable is in when one of the bridge's Thunderbolt ports has a link (bridge0 itself stays "active" without one). With
+# no cable, go straight to the LAN instead of waiting out timeouts on the cable's dead address.
+cable_in() {
+  for m in $(ifconfig bridge0 2>/dev/null | sed -n 's/.*member: \([a-z0-9]*\).*/\1/p'); do
+    ifconfig "$m" 2>/dev/null | grep -q "status: active" && return 0
+  done
+  return 1
+}
+
+if cable_in; then
+  try "$(cat "$cache" 2>/dev/null)" tb
+  ping -c 1 -t 1 169.254.255.255 >/dev/null 2>&1
+  for ip in $(arp -an -i bridge0 2>/dev/null | sed -n 's/^? (\(169\.254\.[0-9.]*\)).*/\1/p'); do
+    try "$ip" tb
+  done
+fi
+
+for ip in $(dscacheutil -q host -a name "$name" | sed -n 's/^ip_address: //p' | grep -v '^169\.254\.'); do
+  try "$ip" lan
+done
+
+# Last, Tailscale, from anywhere. ~/.config/pool/tailscale-<name> holds the other Mac's Tailscale address, and
+# on a Mac whose Tailscale runs in userspace mode (the old Mac's tailscaled) a second word: its SOCKS5 proxy.
+ts="$HOME/.config/pool/tailscale-$name"
+if [ -f "$ts" ]; then
+  read -r ip socks < "$ts"
+  if [ -n "$socks" ]; then
+    nc -z -G 3 -X 5 -x "$socks" "$ip" "$port" 2>/dev/null && exec nc -X 5 -x "$socks" "$ip" "$port"
+  else
+    nc -z -G 3 "$ip" "$port" 2>/dev/null && exec nc "$ip" "$port"
+  fi
+fi
+echo "peer-route: $name isn't reachable over the cable, the LAN or Tailscale" >&2
+exit 1

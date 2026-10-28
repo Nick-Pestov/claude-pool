@@ -97,6 +97,17 @@ anything matching a `protect` substring are never offered for closing.
 
 ---
 
----
+## Two Macs: the pool
 
-*Coming:* a two-Mac version that moves sessions between two of your Macs for more RAM and compute, with a shared filespace.
+If you have a second Mac (an old laptop, a Mac mini at the office), the **two-Mac pool** in [`two-mac/`](two-mac/)
+goes further: it moves Claude Code sessions between your two Macs for **more RAM and compute**, keeps a **shared
+filespace** so a session runs on either, prefers a **Thunderbolt cable** when plugged in (Wi-Fi otherwise), and shows
+both Macs in one menu bar. One Mac travels with you; the other stays put.
+
+Set it up with [`two-mac/setup.sh`](two-mac/setup.sh) on both Macs, then follow the four steps in
+[`two-mac/SETUP.md`](two-mac/SETUP.md) (SSH, file sync, launchd — the parts that need both Macs and your sign-in).
+`pool doctor` checks it. It's config-driven: your two Macs, their labels, ssh aliases and roles live in
+`~/.config/pool/pool.json`, so the same code runs for anyone.
+
+More involved than the single-Mac tool, and it needs a second Mac — but it's the part that actually gives you extra
+RAM and usage.

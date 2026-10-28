@@ -1,0 +1,2108 @@
+#!/usr/bin/env python3
+"""pool top: your two Macs side by side, live: CPU per core, memory, what every Claude session costs, and which
+sessions to move where. The two Macs and their labels come from ~/.config/pool/pool.json; one "travels" with you and
+one "stays" put (optionally running an always-on service).
+
+  pool top                 the monitor in this terminal (? lists the keys; the mouse works too)
+  pool top --once          one text snapshot of both Macs, the sessions and the suggested moves
+  pool top --window        open a Ghostty window running the monitor
+  pool top --agent         JSON lines for PoolBar, the menu bar widget: both Macs, the suggestions, and the popup
+                           to show on this Mac when it's the one you're using
+  pool top --stream [s]    this Mac's samples as JSON lines every s seconds (the other Mac reads them over ssh)
+  pool top --move <session> <tab|moved|bg> <host>   move a session (what the m key and PoolBar's Move run)
+  pool top --close <item>...                        close idle sessions or leftover processes (PoolBar's Close)
+  pool top --snooze <session> <minutes>             no popup for that session for a while
+
+Tiers (`pool tier`, or t here): home (travel) sessions belong on the Mac that goes home with you; stay sessions are
+the ones that matter least and belong on the always-on Mac; float sessions go wherever there's room. Suggestions
+follow from that: home work on the stay Mac moves to the travel Mac; stay work on the travel Mac moves to the stay Mac
+when it has room; float work leaves a Mac that has been past its ceiling for a minute, or is short of memory, for the
+other; CPU-heavy float work prefers the faster Mac's cores and idle float sessions holding memory prefer the Mac with
+more free RAM. The stay Mac's ceiling is a little lower so its always-on service keeps room to burst. Once either Mac
+passes 65% of capacity, the two should stay within 35 points of each other: float work moves from the busier one.
+
+Things nobody is using are offered for closing: Claude sessions untouched for a day (their conversations are kept),
+and processes left running after the Claude session that started them ended (dev servers, test browsers, MCP servers,
+Bash-tool shells). Never the always-on service, Claude Code's own background machinery (which it needs to start a
+session), or any pinned folder. If the always-on service is down for two minutes, you're asked to restart it.
+
+Capacity is counted in the stay Mac's performance cores; a core on the faster Mac is worth more (the per-core weights
+are in the config), so the same percentage on the faster Mac is more real work.
+"""
+from __future__ import annotations
+
+import collections
+import ctypes
+import curses
+import importlib.machinery
+import json
+import locale
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+HOME = str(Path.home())
+POOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pool")  # the sibling pool (installed next to this)
+pool = importlib.machinery.SourceFileLoader("pool", POOL).load_module()
+M5, OLD, SELF, PEER = pool.M5, pool.OLD, pool.SELF, pool.PEER
+OTHER = {M5: OLD, OLD: M5}
+LABEL = pool.CONF["labels"]           # from config: what each Mac is called ("M5"/"M1", or a teammate's names)
+SHORT = pool.CONF["short_of"]         # host -> its cli short token
+STATE = pool.STATE
+SNOOZED = STATE / "snoozed.json"
+GB, MB = 1024 ** 3, 1024 ** 2
+# Share of its capacity a Mac can run at before float work should leave it (the stay Mac keeps headroom for its
+# always-on service); from config.
+CEILING = pool.CONF["ceiling"]
+# kern.memorystatus_level is the share of memory macOS considers free; below MEM_TIGHT, memory should move off.
+MEM_TIGHT, MEM_LOW = 30, 15
+# Once either Mac passes BALANCE_START, the two should stay within BALANCE_GAP of each other (shares of capacity).
+BALANCE_START, BALANCE_GAP = 0.65, 0.35
+# A session untouched this long is offered for closing (its conversation is kept and can be resumed).
+CLOSE_IDLE = 86400
+MOVABLE = ("tab", "moved", "bg")
+
+
+def log(msg):
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(STATE / "top.log", "a") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+
+
+def sh(script, timeout=30):
+    try:
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=timeout).stdout
+    except subprocess.TimeoutExpired:
+        return ""
+
+
+# --- sampling one Mac ---
+
+class Cores:
+    """Busy share of each core between calls, from the kernel's tick counters (host_processor_info, no sudo)."""
+
+    def __init__(self):
+        lib = ctypes.CDLL("/usr/lib/libSystem.dylib")
+        lib.mach_host_self.restype = ctypes.c_uint
+        lib.host_processor_info.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.POINTER(ctypes.c_uint),
+                                            ctypes.POINTER(ctypes.POINTER(ctypes.c_int)), ctypes.POINTER(ctypes.c_uint)]
+        lib.vm_deallocate.argtypes = [ctypes.c_uint, ctypes.c_size_t, ctypes.c_size_t]
+        self.lib, self.host = lib, lib.mach_host_self()
+        self.task = ctypes.c_uint.in_dll(lib, "mach_task_self_").value
+        self.prev = self.ticks()
+
+    def ticks(self):
+        """[user, system, idle, nice] ticks so far, per core."""
+        count, info, n = ctypes.c_uint(), ctypes.POINTER(ctypes.c_int)(), ctypes.c_uint()
+        if self.lib.host_processor_info(self.host, 2, ctypes.byref(count), ctypes.byref(info), ctypes.byref(n)):
+            return []
+        out = [[info[i * 4 + j] & 0xFFFFFFFF for j in range(4)] for i in range(count.value)]
+        self.lib.vm_deallocate(self.task, ctypes.cast(info, ctypes.c_void_p).value, n.value * 4)
+        return out
+
+    def usage(self):
+        now = self.ticks()
+        out = []
+        for a, b in zip(self.prev, now):
+            d = [(y - x) & 0xFFFFFFFF for x, y in zip(a, b)]  # the counters are 32 bits and wrap
+            out.append(round(1 - d[2] / sum(d), 3) if sum(d) else 0.0)
+        self.prev = now
+        return out
+
+
+def layout():
+    """This Mac's chip, its cores in clusters (fastest tier first) and what each core is worth in M1 performance
+    cores. The kernel numbers the slower tier's cores first."""
+    n = int(pool.sysctl("hw.ncpu"))
+    fast = int(pool.sysctl("hw.perflevel0.logicalcpu") or n)
+    slow = n - fast
+    speed, tier2 = pool.SPEED.get(SELF, (1.0, 0.5))
+    clusters = []
+    for level, first, size in ((0, slow, fast), (1, 0, slow)):
+        name = pool.sysctl(f"hw.perflevel{level}.name") or ("fast", "slow")[level]
+        per = int(pool.sysctl(f"hw.perflevel{level}.cpusperl2") or 0) or size or 1
+        clusters += [[name, list(range(i, min(i + per, first + size)))] for i in range(first, first + size, per)]
+    weights = [round(speed * tier2, 3)] * slow + [speed] * fast
+    return {"chip": pool.sysctl("machdep.cpu.brand_string"), "ncpu": n, "clusters": clusters,
+            "weights": weights, "capacity": round(sum(weights), 1)}
+
+
+def memory():
+    """RAM in use the way Activity Monitor counts it (app memory + wired + compressed), swap, and the share of memory
+    macOS considers free (kern.memorystatus_level)."""
+    vm = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    page = re.search(r"page size of (\d+)", vm)
+    page = int(page.group(1)) if page else 16384
+    v = {k.strip('"'): int(n) * page for k, n in re.findall(r"^([^:\n]+):\s+(\d+)\.$", vm, re.M)}
+    out = subprocess.run(["sysctl", "-n", "hw.memsize", "vm.swapusage", "kern.memorystatus_level"],
+                         capture_output=True, text=True).stdout.splitlines() + ["", "", ""]
+    swap = re.search(r"used = ([\d.]+)M", out[1])
+    app = v.get("Anonymous pages", 0) - v.get("Pages purgeable", 0)
+    wired, compressed = v.get("Pages wired down", 0), v.get("Pages occupied by compressor", 0)
+    return {"total": int(out[0]) if out[0].isdigit() else 1, "used": app + wired + compressed, "app": app,
+            "wired": wired, "compressed": compressed, "swap": float(swap.group(1)) * MB if swap else 0.0,
+            "level": int(out[2]) if out[2].strip().isdigit() else 100}
+
+
+def cpu_seconds(text):
+    """ps's cumulative CPU time ("12:34.56", "1-02:03:04") in seconds."""
+    days, _, text = text.rpartition("-")
+    secs = 0.0
+    for part in text.split(":"):
+        secs = secs * 60 + float(part)
+    return (int(days) if days else 0) * 86400 + secs
+
+
+def processes():
+    """{pid: (ppid, CPU seconds so far, resident bytes, executable path, seconds since it started)}."""
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,time=,etime=,rss=,comm="], capture_output=True, text=True).stdout
+    procs = {}
+    for line in out.splitlines():
+        f = line.split(None, 5)
+        if len(f) == 6 and f[0].isdigit():
+            try:
+                procs[int(f[0])] = (int(f[1]), cpu_seconds(f[2]), int(f[4]) * 1024, f[5], cpu_seconds(f[3]))
+            except ValueError:
+                pass
+    return procs
+
+
+# Leftovers: processes launchd adopted because the Claude session that started them is gone. Only Claude's Bash-tool
+# shells (they source a shell snapshot) and dev runtimes (servers, scripts, test browsers, MCP servers) count, and never
+# anything of the service's or any pinned, pool's own, or Claude Code's own background machinery (daemon, spares, pty hosts),
+# which service needs running so a request can start a session at once.
+CLAUDE_SHELL = re.compile(r"shell-snapshots/snapshot-")
+DEV_EXE = re.compile(r"^(node|bun|deno|python\d*(\.\d+)?|Python|pnpm|npm|npx|yarn|java|ruby|esbuild|tsx|vite|vitest|jest|"
+                     r"next-server.*|uvicorn|gunicorn|pytest|chrome-headless-shell|Google Chrome for Testing|Chromium|"
+                     r"chromedriver|ffmpeg|redis-server|postgres)$")
+# Never offer these for closing: pool's own machinery, Mutagen, the link, and (from config) the always-on service and
+# every pinned folder — so a teammate's protected work is as safe as the the service and pinned folders.
+_never = [r"\.local/bin/pool", "pool-top", "mutagen", "peer-route"]
+_never += [re.escape(os.path.basename(p)) for p in pool.CONF["pinned"]]
+_never += [re.escape(pool.CONF["sync_root"] + "/" + os.path.basename(p)) for p in pool.CONF["pinned"]]
+if pool.CONF["always_on"]:
+    _never.append(re.escape(os.path.dirname(pool.CONF["always_on"]["state"])))
+NEVER_CLOSE = re.compile("|".join(_never), re.I)
+LEFTOVER_AGE = 600
+# service's sessions wait for Slack follow-ups with a Bash-tool loop on their thread's signal file. One whose session ended
+# (launchd adopted it) still takes the file's next message, so after service revives the thread with a new session, a
+# follow-up can go to the dead watcher and be lost. Those are the only service processes ever offered for closing.
+# A service whose sessions wait on signal files can leave an orphaned watcher when its session ends; match one by the
+# service's own state directory (from config). None when no such service is configured.
+_svc = pool.CONF["always_on"]
+SERVICE_WATCHER = (re.compile(re.escape(os.path.dirname(_svc["state"])) + r"/signals/([\w.-]+)")
+                   if _svc and _svc.get("state") else None)
+
+
+def leftover(base, args, cwd):
+    """Whether an adopted process (parent gone) is a Claude session's leftover that's safe to offer closing."""
+    if base.startswith("claude") or NEVER_CLOSE.search(args or "") or NEVER_CLOSE.search(cwd or ""):
+        return False
+    if base in ("zsh", "bash", "sh"):
+        return bool(CLAUDE_SHELL.search(args or ""))
+    return bool(DEV_EXE.match(base))
+
+
+def describe(pids, args):
+    """What a leftover process tree is running, from its command lines: "node apiserver.cjs, chrome-headless-shell"."""
+    names = []
+    for p in pids:
+        argv = (args.get(p) or "").split()
+        if not argv:
+            continue
+        exe = os.path.basename(argv[0])
+        if exe in ("zsh", "bash", "sh", "sleep", "caffeinate", "cat", "tail"):
+            continue
+        rest = [a for a in argv[1:] if not a.startswith("-")][:1]
+        name = exe + (" " + os.path.basename(rest[0]) if rest else "")
+        if name not in names:
+            names.append(name)
+    if not names:
+        return "a shell loop left by a Claude session"
+    return ", ".join(names[:3]) + (f" +{len(names) - 3} more" if len(names) > 3 else "")
+
+
+def app_name(path):
+    m = re.search(r"([^/]+)\.app/", path)
+    return m.group(1) if m else os.path.basename(path)
+
+
+def windows_showing_peer():
+    """Ids of the sessions the other Mac runs that a terminal here shows (`pool _remote-claude <id>`); pgrep first,
+    so this doesn't read every process's command line."""
+    pids = sh("pgrep -f 'pool _remote-claude'").split()
+    if not pids:
+        return []
+    out = sh("ps -o tty=,args= -p " + ",".join(pids))
+    return [m.group(2) for m in (re.match(r"(\S+)\s+.*\bpool _remote-claude ([0-9a-f-]{36}) ", l) for l in out.splitlines())
+            if m and m.group(1) not in ("??", "-")]
+
+
+def hid_idle():
+    """Seconds since this Mac's keyboard or pointer was last used (with Universal Control, input counts on the Mac
+    the pointer is on)."""
+    m = re.search(r'"HIDIdleTime" = (\d+)', sh("ioreg -c IOHIDSystem -d 4 -r -k HIDIdleTime"))
+    return round(int(m.group(1)) / 1e9, 1) if m else None
+
+
+class LinkWatch:
+    """The link to the other Mac, kept fresh: whether the Thunderbolt cable is plugged in (asked of the driver twice a
+    second), the bytes crossing it, the round trip to the other Mac on the route in use (every 3 s, and at once after a
+    change) and the routes this Mac's connections take. With act (PoolBar's agent), a change also moves this Mac's
+    connections: off a pulled cable at once, onto a plugged one once it has held for 2 s."""
+
+    def __init__(self, act=False, on_change=None):
+        import socket
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.act, self.on_change = act, on_change
+        self.plugged = pool.cable_plugged(self.sock)
+        self.cable, self.routes, self.rtt, self.rate = False, {}, None, (0.0, 0.0)
+        self.lan = (0.0, None)  # (when looked up, the other Mac's address on the office network)
+        self.cable_ip = None
+        self.wake, self.closed, self.wrong = threading.Event(), False, 0
+        threading.Thread(target=self.fast, daemon=True).start()
+        threading.Thread(target=self.slow, daemon=True).start()
+
+    def snapshot(self):
+        return {"plugged": self.plugged, "cable": self.cable, "routes": dict(self.routes), "rtt": self.rtt,
+                "rx": round(self.rate[0]), "tx": round(self.rate[1])}
+
+    def fast(self):
+        counters, n = None, 0
+        while not self.closed:
+            try:
+                plugged = pool.cable_plugged(self.sock)
+                if plugged != self.plugged:
+                    self.plugged, self.cable, self.rtt = plugged, False, None
+                    self.wake.set()
+                    if self.on_change:
+                        self.on_change()
+                    if self.act:
+                        threading.Thread(target=self.move, args=(plugged,), daemon=True).start()
+                if n % 8 == 0:  # every 4 s
+                    c = bridge_bytes()
+                    if counters and c:
+                        dt = c[0] - counters[0]
+                        self.rate = (max(0, c[1] - counters[1]) / dt, max(0, c[2] - counters[2]) / dt) if dt > 0 else self.rate
+                    counters = c
+            except Exception as e:
+                log(f"link watch failed: {e!r}")
+            n += 1
+            time.sleep(0.5)
+
+    def move(self, plugged):
+        if plugged:  # let the link settle and the other Mac answer on it
+            time.sleep(2)
+            if not self.plugged:
+                return
+        out = subprocess.run([sys.executable, POOL, "_reroute"], capture_output=True, text=True).stdout
+        if out.strip():
+            log("link change: " + out.strip().replace("\n", "; "))
+        self.wake.set()
+
+    def slow(self):
+        """Every 3 s: does the other Mac answer on the cable, and the round trip. The routes (a `ps`) after a change and
+        every 15 s."""
+        n = 0
+        while not self.closed:
+            woken = self.wake.is_set()
+            self.wake.clear()
+            before = (self.cable, dict(self.routes))
+            try:
+                if woken or n % 5 == 0:  # pool's connections (your own ssh sessions are never moved, so not counted)
+                    self.routes = collections.Counter(l["route"] for l in pool.peer_links() if l["kind"] != "other")
+                # One ping both times the round trip and, with the cable in, shows the other Mac answers on it (its
+                # address from peer-route's cache, or found again on the bridge when that stops answering).
+                if self.plugged:
+                    self.rtt = ping(self.cable_ip) if self.cable_ip else None
+                    if self.rtt is None:
+                        self.cable_ip = pool.cable_peer()
+                        self.rtt = ping(self.cable_ip)
+                    self.cable = self.rtt is not None
+                else:
+                    self.cable, self.rtt = False, ping(self.lan_ip())
+                # Anything on the wrong route on two checks in a row gets moved, and again every 30 s until it's right:
+                # on Wi-Fi while the cable answers, or on a pulled cable.
+                wrong = (self.plugged and self.cable and any(r != "cable" for r in self.routes)) or \
+                        (not self.plugged and self.routes.get("cable", 0) > 0)
+                self.wrong = self.wrong + 1 if wrong else 0
+                if self.act and self.wrong >= 2 and (self.wrong - 2) % 10 == 0:
+                    threading.Thread(target=self.move, args=(self.plugged,), daemon=True).start()
+            except Exception as e:
+                log(f"link check failed: {e!r}")
+            if self.on_change and before != (self.cable, dict(self.routes)):
+                self.on_change()
+            n += 1
+            self.wake.wait(3)
+
+    def lan_ip(self):
+        """The other Mac's address on the office network (what peer-route uses without the cable), looked up each
+        minute from its Bonjour name."""
+        if time.time() - self.lan[0] > 60:
+            names = [f.name[len("peer-route-"):] for f in Path(HOME, ".cache").glob("peer-route-*")]
+            out = sh(f"dscacheutil -q host -a name {shlex.quote(names[0])}") if names else ""
+            ips = [ip for ip in re.findall(r"ip_address: (\S+)", out) if not ip.startswith("169.254.")]
+            self.lan = (time.time(), ips[0] if ips else None)
+        return self.lan[1]
+
+
+def ping(ip):
+    """Round trip to ip in milliseconds (one ICMP echo, a second at most), or None."""
+    if not ip:
+        return None
+    m = re.search(r"time=([\d.]+) ms", sh(f"ping -c 1 -t 1 {shlex.quote(ip)}", timeout=3))
+    return round(float(m.group(1)), 2) if m else None
+
+
+def bridge_bytes():
+    """(when, bytes in, bytes out) on the Thunderbolt bridge so far, or None. Only the Macs talk over it."""
+    for line in sh("netstat -ibn -I bridge0").splitlines():
+        f = line.split()
+        if len(f) >= 10 and f[2].startswith("<Link#"):
+            return time.time(), int(f[6]), int(f[9])
+    return None
+
+
+class Sampler:
+    """What this Mac is doing: per-core CPU, memory, and each Claude session's process tree (CPU and memory of the
+    session and everything it started), service, the busiest apps outside them, and the link to the other Mac."""
+
+    def __init__(self, act=False, on_change=None):
+        self.link = LinkWatch(act, on_change)
+        self.static = layout()
+        self.cores = Cores()
+        self.prev_cpu, self.prev_t = {}, None
+        self.transcripts = {}
+        try:
+            self.ws = pool.workspace()
+        except (OSError, ImportError):
+            self.ws = None
+        self.slow = {}
+        self.leftovers, self.leftovers_at = [], 0.0
+        self.claude_pids, self.personal, self.closed = None, [], False
+        self.refresh()
+        threading.Thread(target=self.refresh_loop, daemon=True).start()
+
+    def refresh_loop(self):
+        """Which Mac you're using every 5 s (cheap); the rest every 15 s, or at once when a Claude process starts or
+        ends. `claude agents` starts Node each time, which is most of what sampling costs."""
+        n = 0
+        while not self.closed:
+            time.sleep(5)
+            n += 1
+            try:
+                if n % 3 == 0 or self.claude_pids != self.slow.get("claude_pids"):
+                    self.refresh(personal=n % 12 == 0)
+                else:
+                    self.slow = dict(self.slow, hid=hid_idle())
+            except Exception as e:  # keep sampling with the last good values; the log says what broke
+                log(f"sampler refresh failed: {e!r}")
+
+    def refresh(self, personal=True):
+        """The slower facts: the sessions `claude agents` knows (the legacy claude-personal profile only when
+        personal is set), service's process, which sessions run here in pool's tmux for the other Mac's windows, which
+        windows here show the other Mac's sessions, moves."""
+        claude_pids = self.claude_pids
+        agents = []
+        for profile in ("claude", "claude-personal") if personal else ("claude",):
+            out = sh(pool.PREAMBLE + f"command -v {profile} >/dev/null && {profile} agents --json 2>/dev/null || echo '[]'")
+            try:
+                found = [dict(a, profile=profile) for a in json.loads(out or "[]")]
+            except ValueError:
+                found = []
+            if profile == "claude-personal":
+                self.personal = found
+            agents += found
+        if not personal:
+            agents += self.personal
+        launchd = {int(f[0]) for f in (l.split() for l in sh("launchctl list").splitlines()[1:]) if f and f[0].isdigit()}
+        service = None
+        if SELF == OLD:
+            m = re.search(r'"PID" = (\d+);', sh(f"launchctl list {pool.SERVICE_LABEL} 2>/dev/null"))
+            service = int(m.group(1)) if m else None
+        panes = {p: n for p, n in pool.pool_tmux_panes().items()
+                 if n.startswith("pool-") and not n.startswith(("pool-sh-", "pool-home"))}
+        try:
+            moves = json.loads((STATE / "moves.json").read_text())
+        except (OSError, ValueError):
+            moves = {}
+        mtime = {}
+        for a in agents:
+            sid = a.get("sessionId")
+            if not (a.get("pid") and sid):
+                continue
+            path = self.transcripts.get(sid) or (self.ws.find_transcript(sid) if self.ws else None)
+            try:
+                mtime[sid] = os.stat(path).st_mtime if path else None
+                self.transcripts[sid] = path
+            except OSError:
+                self.transcripts.pop(sid, None)
+        self.slow = {"agents": agents, "service": service, "panes": panes, "moves": moves, "mtime": mtime, "launchd": launchd,
+                     "shown": windows_showing_peer(), "hid": hid_idle(), "claude_pids": claude_pids}
+
+    def find_leftovers(self, procs, rate, tree, now):
+        """Process trees whose Claude session is gone (see leftover()), running at least LEFTOVER_AGE."""
+        cands = [pid for pid, p in procs.items() if p[0] == 1 and pid not in self.slow["launchd"] and p[4] >= LEFTOVER_AGE
+                 and (os.path.basename(p[3]) in ("zsh", "bash", "sh") or DEV_EXE.match(os.path.basename(p[3])))]
+        if not cands:
+            return []
+        trees = {pid: tree(pid) for pid in cands}
+        every = sorted({p for t in trees.values() for p in t})
+        args = {}
+        for line in sh("ps -o pid=,args= -p " + ",".join(map(str, every))).splitlines():
+            pid, _, a = line.strip().partition(" ")
+            if pid.isdigit():
+                args[int(pid)] = a.strip()
+        cwd, cur = {}, None
+        for line in sh("lsof -a -d cwd -Fpn -p " + ",".join(map(str, cands))).splitlines():
+            if line.startswith("p"):
+                cur = int(line[1:])
+            elif line.startswith("n") and cur:
+                cwd[cur] = line[1:]
+        out = []
+        for pid in cands:
+            a, t = args.get(pid, ""), trees[pid]
+            watcher = SERVICE_WATCHER.search(a) if SERVICE_WATCHER and CLAUDE_SHELL.search(a) else None
+            if not watcher and (not leftover(os.path.basename(procs[pid][3]), a, cwd.get(pid, ""))
+                                or any(NEVER_CLOSE.search(args.get(p, "")) for p in t)):
+                continue
+            out.append({"pid": pid, "start": round(now - procs[pid][4]), "age": round(procs[pid][4]),
+                        "cpu": round(sum(rate.get(p, 0) for p in t), 3), "rss": sum(procs[p][2] for p in t if p in procs),
+                        "cwd": cwd.get(pid, ""), "n": len(t), "watcher": watcher.group(1) if watcher else None,
+                        "what": "service watcher left by an ended session" if watcher else describe(t, args)})
+        return out
+
+    def sample(self):
+        now = time.time()
+        procs = processes()
+        slow = self.slow
+        dt = now - self.prev_t if self.prev_t else 0
+        ncpu = self.static["ncpu"]
+        rate = {}
+        for pid, (_, cpu, _, _, _) in procs.items():
+            before = self.prev_cpu.get(pid, 0.0)  # a process new since the last sample used all its time since then
+            rate[pid] = min(ncpu, max(0.0, cpu - before) / dt) if dt else 0.0
+        self.prev_cpu, self.prev_t = {pid: p[1] for pid, p in procs.items()}, now
+        kids = collections.defaultdict(list)
+        for pid, p in procs.items():
+            kids[p[0]].append(pid)
+
+        def tree(root):
+            out, todo = [], [root]
+            while todo:
+                p = todo.pop()
+                out.append(p)
+                todo += kids.get(p, [])
+            return out
+
+        def where(pid, kind):
+            if pid in slow["panes"]:
+                return "moved"  # runs here in pool's tmux, shown in a window on the other Mac
+            if kind == "background":
+                return "bg"
+            p = procs[pid][0]
+            while p > 1 and p in procs:
+                base = os.path.basename(procs[p][3])
+                if base == "ghostty":
+                    return "tab"
+                if base == "tmux":
+                    return "tmux"
+                if "sshd" in base:
+                    return "ssh"
+                p = procs[p][0]
+            return "other"
+
+        # Claude session processes (not Claude Code's background machinery): a change makes the next refresh early
+        # (10 s old, so a passing `claude agents` call, ours included, doesn't count)
+        self.claude_pids = frozenset(pid for pid, p in procs.items() if os.path.basename(p[3]) == "claude" and p[4] >= 10)
+        sessions, claimed, seen = [], set(), set()
+        for a in slow["agents"]:
+            pid = int(a.get("pid") or 0)
+            if pid not in procs or pid in seen or not a.get("sessionId"):
+                continue
+            seen.add(pid)
+            t = tree(pid)
+            claimed.update(t)
+            mt = slow["mtime"].get(a["sessionId"])
+            sessions.append({"sid": a["sessionId"], "pid": pid, "profile": a.get("profile") or "claude",
+                             "id": a.get("id") or "", "name": a.get("name") or "", "cwd": a.get("cwd") or "",
+                             "kind": a.get("kind") or "", "status": a.get("status") or "",
+                             "waiting": a.get("waitingFor") or "", "cpu": round(sum(rate[p] for p in t), 3),
+                             "rss": sum(procs[p][2] for p in t), "idle": round(now - mt) if mt else None,
+                             "where": where(pid, a.get("kind"))})
+        service = None
+        if slow["service"] in procs:
+            t = tree(slow["service"])
+            claimed.update(t)
+            service = {"cpu": round(sum(rate[p] for p in t), 3), "rss": sum(procs[p][2] for p in t)}
+        apps = collections.defaultdict(lambda: [0.0, 0])
+        for pid, (_, _, rss, comm, _) in procs.items():
+            if pid not in claimed:
+                a = apps[app_name(comm)]
+                a[0] += rate[pid]
+                a[1] += rss
+        top = sorted(([n, round(c, 2), r] for n, (c, r) in apps.items()), key=lambda x: -x[1])[:6]
+        if now - self.leftovers_at >= 120 and dt:  # leftovers are 10+ minutes old, so every 2 minutes is plenty
+            self.leftovers_at = now
+            try:
+                self.leftovers = self.find_leftovers(procs, rate, tree, now)
+            except Exception as e:
+                log(f"leftover scan failed: {e!r}")
+        return {"host": SELF, "ts": now, **self.static, "cores": self.cores.usage(), "load": os.getloadavg(),
+                "mem": memory(), "sessions": sessions, "service": service, "apps": top, "shown_here": slow["shown"],
+                "moves": slow["moves"], "hid": slow["hid"], "leftovers": self.leftovers, "link": self.link.snapshot(),
+                "service_up": slow["service"] is not None if SELF == OLD else None}
+
+
+SHARED = STATE / "sample.json"  # PoolBar's agent publishes each sample of this Mac here
+
+
+def publish(sample):
+    tmp = SHARED.with_suffix(".tmp")
+    tmp.write_text(json.dumps(sample, separators=(",", ":")))
+    os.replace(tmp, SHARED)
+
+
+def shared_sample(max_age):
+    """The sample PoolBar's agent published last, if it's this Mac's and fresh."""
+    try:
+        s = json.loads(SHARED.read_text())
+    except (OSError, ValueError):
+        return None
+    return s if s.get("host") == SELF and time.time() - s.get("ts", 0) < max_age else None
+
+
+class LocalSamples:
+    """This Mac's samples, so each Mac measures itself once: the ones PoolBar's agent publishes while it runs, else
+    from a Sampler of our own (started when needed, stopped when the agent's are back)."""
+
+    def __init__(self, interval):
+        self.interval, self.sampler, self.last = interval, None, 0.0
+
+    def next(self):
+        while True:
+            s = shared_sample(max(6.0, 3 * self.interval))
+            if s:
+                if self.sampler:
+                    self.sampler.closed = self.sampler.link.closed = True
+                    self.sampler = None
+                if s["ts"] > self.last:
+                    self.last = s["ts"]
+                    return s
+                time.sleep(0.4)
+                continue
+            if not self.sampler:
+                self.sampler = Sampler()
+                self.sampler.sample()  # the first one has no CPU deltas yet
+            time.sleep(max(0.05, self.interval - (time.time() - self.last)))
+            s = self.sampler.sample()
+            self.last = s["ts"]
+            return s
+
+
+def stream(interval):
+    """--stream: print this Mac's samples until whoever reads them goes away."""
+    source = LocalSamples(interval)
+    while True:
+        s = source.next()
+        try:
+            print(json.dumps(s, separators=(",", ":")), flush=True)
+        except BrokenPipeError:
+            return
+        if os.getppid() == 1:
+            return
+
+
+# --- both Macs ---
+
+class Feed:
+    """Samples from both Macs as they arrive: this Mac's from a Sampler, the other's streamed over ssh. Keeps an hour
+    of history per Mac and five minutes of CPU per session."""
+
+    def __init__(self, interval, peer=True, publish=False):
+        self.interval, self.publish = interval, publish
+        self.changed = threading.Event()  # set when the link changes, so the agent redraws without waiting
+        self.watch = None
+        self.lock = threading.Lock()
+        self.latest = {}
+        self.hist = {h: collections.deque(maxlen=int(3600 / interval) + 1) for h in (M5, OLD)}
+        self.sess = {}
+        self.peer_note = f"connecting to the {LABEL[PEER]}…"
+        threading.Thread(target=self.local, daemon=True).start()
+        if peer:
+            threading.Thread(target=self.remote, daemon=True).start()
+
+    def add(self, s):
+        t = time.time()  # arrival time, so the other Mac's clock doesn't matter
+        s["_at"] = t
+        util = sum(c * w for c, w in zip(s["cores"], s["weights"])) / s["capacity"]
+        m = s["mem"]
+        n = int(300 / self.interval) + 1
+        with self.lock:
+            self.latest[s["host"]] = s
+            self.hist[s["host"]].append((t, s["cores"], util, m["used"] / m["total"], m["level"], m["swap"]))
+            live = set()
+            for r in s["sessions"]:
+                key = (s["host"], r["pid"])
+                live.add(key)
+                self.sess.setdefault(key, collections.deque(maxlen=n)).append(r["cpu"])
+            for key in [k for k in self.sess if k[0] == s["host"] and k not in live]:
+                del self.sess[key]
+
+    def local(self):
+        """PoolBar's agent samples this Mac and publishes each sample; anyone else reuses those (LocalSamples)."""
+        if not self.publish:
+            source = LocalSamples(self.interval)
+            while True:
+                try:
+                    self.add(source.next())
+                except Exception as e:
+                    log(f"local sample failed: {e!r}")
+                    time.sleep(self.interval)
+        sampler = Sampler(act=True, on_change=self.changed.set)
+        self.watch = sampler.link
+        sampler.sample()
+        while True:
+            t = time.time()
+            time.sleep(max(0.05, self.interval - (time.time() - t)))
+            try:
+                s = sampler.sample()
+                publish(s)
+                self.add(s)
+            except Exception as e:
+                log(f"local sample failed: {e!r}")
+
+    def remote(self):
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5",
+               "-o", "ServerAliveCountMax=2", "-o", "ControlMaster=no", "-o", "ControlPath=none", pool.ALIAS[PEER],
+               "bash -c " + shlex.quote(pool.PREAMBLE + f"exec python3 ~/.local/bin/pool-top --stream {self.interval}")]
+        wait = 2
+        while True:
+            try:
+                STATE.mkdir(parents=True, exist_ok=True)
+                with open(STATE / "top.log", "a") as err:
+                    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, stdin=subprocess.DEVNULL, text=True)
+                    for line in p.stdout:
+                        try:
+                            self.add(json.loads(line))
+                        except (ValueError, KeyError, TypeError):
+                            continue
+                        self.peer_note, wait = "", 2
+                    p.wait()
+            except OSError as e:
+                log(f"stream from the {LABEL[PEER]} failed: {e!r}")
+            with self.lock:
+                self.latest.pop(PEER, None)
+            self.peer_note = f"can't reach the {LABEL[PEER]}; retrying"
+            time.sleep(wait)
+            wait = min(wait * 2, 30)
+
+    def history(self, host):
+        with self.lock:
+            return list(self.hist[host])
+
+
+class Meta:
+    """Pins and the tiers Nick chose, refreshed in the background (reading service's sessions can take an ssh)."""
+
+    def __init__(self):
+        self.pins, self.chosen, self.service = set(pool.OLD_MAC_WORK), pool.chosen_tiers(), set()
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def loop(self):
+        while True:
+            try:
+                self.service = pool.service_sessions()
+                self.pins = pool.pinned()
+            except Exception as e:
+                log(f"reading pins failed: {e!r}")
+            self.chosen = pool.chosen_tiers()
+            time.sleep(15)
+
+    def set_tier(self, sid, tier):
+        chosen = dict(self.chosen)
+        if tier == "auto":
+            chosen.pop(sid[:8], None)
+        else:
+            chosen[sid[:8]] = tier
+        self.chosen = chosen
+        pool.set_tier(sid, tier)
+
+
+# --- deciding what should move ---
+
+def room(m, host):
+    """Capacity left before the Mac's ceiling, in M1 performance cores."""
+    return max(0.0, CEILING[host] - m["util"]) * m["capacity"]
+
+
+def gb(n):
+    return f"{n / GB:.1f} GB" if n >= GB else f"{n / MB:.0f} MB"
+
+
+def cores(n):
+    """CPU in cores: two decimals under one core (most Claude sessions use a few hundredths), one above."""
+    return f"{n:.2f}" if n < 0.995 else f"{n:.1f}"
+
+
+def place(s):
+    moved = f"on the {LABEL[s['host']]} " + ("with no window" if s["window"] == "no window" else f"for the {s['window']}")
+    return {"tab": f"in an {LABEL[s['host']]} tab", "moved": moved,
+            "bg": f"in the background on the {LABEL[s['host']]}"}.get(s["where"], f"on the {LABEL[s['host']]}")
+
+
+def ago(secs):
+    if secs is None:
+        return "?"
+    if secs < 60:
+        return "now"
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return f"{int(secs // size)}{unit}"
+    return "now"
+
+
+def recommend(macs, sessions):
+    """Suggested moves, most pressing first, at most one per session.
+
+    macs: {host: {"util": share of capacity busy over the last minute, "capacity": in M1 performance cores,
+    "level": share of memory free (kern.memorystatus_level), "free": bytes not in use, "total": bytes}}. With a Mac
+    missing (out of reach), nothing is suggested.
+    sessions: dicts with sid, pid, name, host, tier, why, status, where, units (5-minute CPU average in M1 cores),
+    rss (bytes, with everything the session started), idle (seconds since its conversation changed, or None),
+    movable, pinned and moved (moved in the last half hour).
+    Returns dicts with sid, pid, name, where, src, dst, busy, why and level: 0 home work about to be left behind,
+    1 a Mac past its ceiling or short of memory, 2 tidying up (worth doing, nothing suffers meanwhile)."""
+    if M5 not in macs or OLD not in macs:
+        return []
+    out = {}
+
+    def add(s, level, why, kind="move"):
+        if s["sid"] not in out or level < out[s["sid"]]["level"]:
+            out[s["sid"]] = {"sid": s["sid"], "pid": s["pid"], "name": s["name"], "where": s["where"],
+                             "src": s["host"], "dst": OTHER[s["host"]], "level": level, "why": why, "kind": kind,
+                             "busy": s["status"] == "busy"}
+
+    def fits(s, dst, extra=0.0):
+        m = macs[dst]
+        return m["level"] >= MEM_TIGHT and m["util"] + (extra + s["units"]) / m["capacity"] < CEILING[dst]
+
+    ok = [s for s in sessions if s["movable"] and not s["pinned"] and not s["moved"]]
+    for s in ok:
+        if s["tier"] == "home" and s["host"] == OLD:
+            add(s, 0, f"home tier ({s['why']}) but running on {LABEL[OLD]}, so it stays behind when you take "
+                      f"{LABEL[M5]} with you")
+        elif s["tier"] == "m1" and s["host"] == M5 and fits(s, OLD):
+            add(s, 2, f"stay-tier ({s['why']}); moving it frees {gb(s['rss'])} and its CPU on {LABEL[M5]}")
+    for src in (M5, OLD):
+        dst = OTHER[src]
+        m, d = macs[src], macs[dst]
+        floats = [s for s in ok if s["host"] == src and s["tier"] == "float"]
+        if m["util"] >= CEILING[src] and room(d, dst) > room(m, src):
+            excess, shed = (m["util"] - CEILING[src]) * m["capacity"], 0.0
+            for s in sorted(floats, key=lambda s: -s["units"]):
+                if shed >= excess or s["units"] < 0.25:
+                    break
+                if fits(s, dst, shed):
+                    add(s, 1, f"the {LABEL[src]} has run at {m['util']:.0%} of its capacity for a minute (limit "
+                              f"{CEILING[src]:.0%}); this session averaged {s['units']:.1f} cores over 5 min and the "
+                              f"{LABEL[dst]} has {room(d, dst):.0f} to spare")
+                    shed += s["units"]
+        if m["level"] < MEM_TIGHT and d["level"] >= m["level"] + 10:
+            need, freed = (MEM_TIGHT - m["level"]) / 100 * m["total"], 0
+            for s in sorted(floats, key=lambda s: -s["rss"]):
+                if freed >= need or s["rss"] < 512 * MB:
+                    break
+                if d["free"] > s["rss"] + 2 * GB:
+                    add(s, 1, f"the {LABEL[src]} is short of memory ({m['level']}% free); this session holds "
+                              f"{gb(s['rss'])} and the {LABEL[dst]} has {gb(d['free'])} free")
+                    freed += s["rss"]
+    # Keep the two within BALANCE_GAP of each other once either passes BALANCE_START: move the busiest float work
+    # from the busier Mac until the projected gap is back inside it.
+    hi = M5 if macs[M5]["util"] >= macs[OLD]["util"] else OLD
+    lo = OTHER[hi]
+    m, d = macs[hi], macs[lo]
+    gap = m["util"] - d["util"]
+    if m["util"] > BALANCE_START and gap > BALANCE_GAP:
+        need = (gap - BALANCE_GAP) / (1 / m["capacity"] + 1 / d["capacity"])
+        shed = 0.0
+        for s in sorted((s for s in ok if s["host"] == hi and s["tier"] == "float"), key=lambda s: -s["units"]):
+            if shed >= need or s["units"] < 0.25:
+                break
+            if fits(s, lo, shed):
+                add(s, 1, f"the {LABEL[hi]} has averaged {m['util']:.0%} for a minute against {d['util']:.0%} on the "
+                          f"{LABEL[lo]} (they should stay within {BALANCE_GAP:.0%}); this session averaged "
+                          f"{s['units']:.1f} cores over 5 min")
+                shed += s["units"]
+    for s in ok:
+        if s["tier"] != "float":
+            continue
+        if s["host"] == OLD and s["units"] >= 1.0 and room(macs[M5], M5) >= 2 * s["units"] and macs[M5]["util"] < 0.6:
+            ratio = pool.SPEED[M5][0] / pool.SPEED[OLD][0]
+            add(s, 2, f"busy on {LABEL[OLD]} ({s['units']:.1f} cores over 5 min); {LABEL[M5]} has {room(macs[M5], M5):.0f} "
+                      f"to spare and its cores are about {ratio:.1f}x faster", "power")
+        elif (s["host"] == M5 and s["status"] != "busy" and (s["idle"] or 0) >= 1800 and s["rss"] >= GB
+              and macs[M5]["level"] < 50 and macs[OLD]["level"] >= macs[M5]["level"] + 10 and fits(s, OLD)):
+            add(s, 2, f"idle for {ago(s['idle'])} and holding {gb(s['rss'])}; {LABEL[OLD]} has more memory to spare", "memory")
+    return sorted(out.values(), key=lambda r: (r["level"], r["busy"]))
+
+
+def duplicates(sessions):
+    """The same conversation running in two processes (both write one transcript), as warnings."""
+    by = collections.defaultdict(list)
+    for s in sessions:
+        by[s["sid"]].append(s)
+    return [f"{sid[:8]} “{short(rs[0]['name'] or 'unnamed', 30)}” runs {len(rs)} times ("
+            + " and ".join(place(r) for r in rs) + "): close one, both copies write the same conversation"
+            for sid, rs in by.items() if len(rs) > 1]
+
+
+WINDOW = {"tab": "{here} tab", "bg": "background", "tmux": "tmux", "ssh": "ssh", "other": "-"}
+
+
+def view(feed, meta, now=None):
+    """What the monitor, the menu bar and the popups show: each Mac's numbers, every session with its tier and its
+    5-minute CPU average, the suggested moves and duplicate sessions."""
+    now = now or time.time()
+    stale = max(10, 5 * feed.interval)
+    with feed.lock:
+        latest = {h: s for h, s in feed.latest.items() if now - s["_at"] < stale}
+        recent = {h: list(feed.hist[h])[-max(1, int(60 / feed.interval)):] for h in latest}
+        cpu = {k: sum(v) / len(v) for k, v in feed.sess.items() if v}
+    if feed.watch and SELF in latest:  # this Mac's link as of now, not as of the last sample
+        latest[SELF] = dict(latest[SELF], link=feed.watch.snapshot())
+    macs = {}
+    for h, s in latest.items():
+        m = s["mem"]
+        macs[h] = {"util": sum(e[2] for e in recent[h]) / len(recent[h]), "util_now": recent[h][-1][2],
+                   "capacity": s["capacity"], "ncpu": s["ncpu"], "level": m["level"], "total": m["total"],
+                   "free": max(0, m["total"] - m["used"]), "used": m["used"], "swap": m["swap"], "hid": s.get("hid")}
+    moves, shown = {}, {}
+    for h, s in latest.items():
+        for k, t in (s.get("moves") or {}).items():
+            moves[k] = max(moves.get(k, 0), t)
+        shown[h] = set(s.get("shown_here") or ())
+    pin_paths = [p for p in meta.pins if p.startswith("/")]
+    rows = []
+    for h, s in latest.items():
+        for r in s["sessions"]:
+            tier, why = pool.tier_of(r["sid"], r["name"], r["cwd"], r["kind"], r["idle"], meta.pins, meta.chosen)
+            avg = cpu.get((h, r["pid"]), r["cpu"])
+            window = (f"{LABEL[OTHER[h]]} tab" if r["sid"] in shown.get(OTHER[h], ()) else "no window") \
+                if r["where"] == "moved" else WINDOW[r["where"]].format(here=LABEL[h])
+            rows.append(dict(r, host=h, tier=tier, why=why, auto=why != "set by you", cpu5=avg,
+                             units=avg * s["capacity"] / s["ncpu"], window=window,
+                             pinned=r["sid"][:8] in meta.pins or bool(pool.covering(r["cwd"], pin_paths)),
+                             moved=now - moves.get(r["sid"][:8], 0) < 1800, movable=r["where"] in MOVABLE))
+    dups = duplicates(rows)
+    twice = {sid for sid, n in collections.Counter(r["sid"] for r in rows).items() if n > 1}
+    for r in rows:
+        r["movable"] = r["movable"] and r["sid"] not in twice
+    recs = recommend(macs, rows)
+    return {"now": now, "macs": macs, "latest": latest, "sessions": rows, "recs": recs, "dups": dups,
+            "link": link_state(latest),
+            "cleanup": cleanup(rows, latest, meta.service, twice), "imbalance": imbalance(macs, recs, latest),
+            "service": latest[OLD].get("service_up") if OLD in latest else None}
+
+
+def link_state(latest):
+    """How the Macs are connected, from both sides' reports: "cable" when every connection between them is on the
+    Thunderbolt cable, "moving" when the cable answers but some are still on Wi-Fi (the pool daemon moves them within
+    a minute), "wifi" when there's no cable. None when a side hasn't reported (out of reach, or still starting)."""
+    reports = {h: s.get("link") for h, s in latest.items() if s.get("link")}
+    mine = reports.get(SELF) or next(iter(reports.values()), None)
+    if not mine:
+        return None
+    plugged = lambda r: r.get("plugged", r.get("cable"))
+    rtt = mine.get("rtt")
+    speed = "–" if rtt is None else f"{rtt:.1f} ms" if rtt < 10 else f"{rtt:.0f} ms"
+    if any(plugged(r) is False for r in reports.values()):  # one side says unplugged: that's final, no need to wait
+        state, text = "wifi", "Over Wi-Fi (cable not plugged in)"
+        off = None
+    elif len(reports) < 2:
+        return None
+    else:
+        routes = collections.Counter()
+        for r in reports.values():
+            routes.update(r["routes"])
+        off = sum(n for route, n in routes.items() if route != "cable")
+        if all(r.get("cable") for r in reports.values()) and not off:
+            state, text = "cable", "Thunderbolt cable"
+        else:
+            state, text = "moving", (f"Cable plugged in, moving {off} connection{'s' if off != 1 else ''} off Wi-Fi"
+                                     if off else "Cable plugged in, waiting for the other Mac to answer on it")
+    rate = (mine.get("rx") or 0) + (mine.get("tx") or 0)
+    detail = f"{speed} round trip" + (f" · {gb(rate)}/s crossing now" if state == "cable" and rate >= MB / 10 else "")
+    return {"state": state, "text": f"{text} · {detail}", "speed": speed, "rtt": rtt, "off": off}
+
+
+def cleanup(rows, latest, service_ids, twice):
+    """What nobody is using, to offer closing, biggest first: sessions between turns and untouched for CLOSE_IDLE
+    (their conversations are kept), and leftover processes whose Claude session is gone. service's sessions qualify
+    like any other (an ended thread wakes a fresh session on Nick's next message, the way service already treats
+    threads whose session wound down); service's own processes and Claude's background machinery never do."""
+    items = []
+    for r in rows:
+        if r["status"] != "idle" or (r["idle"] or 0) < CLOSE_IDLE or r["sid"] in twice:
+            continue
+        note = ("service wakes a fresh session for its thread on your next message there" if r["sid"][:8] in service_ids
+                else f"conversation kept: claude attach {r.get('id') or r['sid'][:8]}" if r["kind"] == "background"
+                else f"conversation kept: claude --resume {r['sid'][:8]}")
+        items.append({"key": "s:" + r["sid"][:8], "host": r["host"], "kind": "session", "label": r["name"] or r["sid"][:8],
+                      "detail": f"idle {ago(r['idle'])}, {gb(r['rss'])}", "note": note, "rss": r["rss"],
+                      "spec": "|".join([SHORT[r["host"]], "session", r["sid"], str(r["pid"]), r.get("profile") or "claude",
+                                        r["kind"], r.get("id") or ""])})
+    for h, s in latest.items():
+        for o in s.get("leftovers") or []:
+            items.append({"key": f"p:{SHORT[h]}:{o['pid']}:{o['start']}", "host": h,
+                          "kind": "watcher" if o.get("watcher") else "leftover", "label": o["what"],
+                          "detail": f"no session, running {ago(o['age'])}, {gb(o['rss'])}"
+                                    + (f", {cores(o['cpu'])} cores" if o["cpu"] >= 0.1 else ""),
+                          "note": f"thread {o['watcher']}: it can take your next follow-up there before service's new session sees it"
+                                  if o.get("watcher") else "in " + (o["cwd"].replace(HOME, "~") or "?"),
+                          "rss": o["rss"], "spec": f"{SHORT[h]}|procs|{o['pid']}|{o['start']}"})
+    # service's dead watchers first (they can lose a message), then whatever holds the most memory
+    return sorted(items, key=lambda i: (i["kind"] != "watcher", -i["rss"]))
+
+
+def imbalance(macs, recs, latest):
+    """When the Macs are further apart than BALANCE_GAP but no Claude session there is busy enough to move, say what
+    the load is instead, so the gap isn't a mystery. None otherwise."""
+    if M5 not in macs or OLD not in macs:
+        return None
+    hi = M5 if macs[M5]["util"] >= macs[OLD]["util"] else OLD
+    lo = OTHER[hi]
+    if macs[hi]["util"] <= BALANCE_START or macs[hi]["util"] - macs[lo]["util"] <= BALANCE_GAP:
+        return None
+    if any(r["src"] == hi and r["level"] <= 1 for r in recs):
+        return None
+    apps = ", ".join(f"{n} {cores(c)}" for n, c, _ in latest[hi]["apps"][:3] if c >= 0.1)
+    return (f"The {LABEL[hi]} is at {macs[hi]['util']:.0%} against {macs[lo]['util']:.0%} on the {LABEL[lo]}, but no Claude "
+            f"session there is busy enough to move" + (f"; the load is {apps} (cores)" if apps else ""))
+
+
+def do_move(sid, where, dst):
+    """Move session sid to dst: a Ghostty tab with `pool tab` (what /change-computer runs; its window stays and the
+    conversation resumes on the other Mac), a background session with `pool move`. Returns (ok, message)."""
+    pool_cmd = [sys.executable, POOL]
+    try:
+        if where in ("tab", "moved"):
+            # --show: a move the user clicked, so pool brings Ghostty forward to make the reconnect visible
+            p = subprocess.run(pool_cmd + ["tab", sid, "--show"], capture_output=True, text=True, timeout=120)
+            ok, msg = p.returncode == 0, (p.stdout + p.stderr).strip()
+        elif where == "bg":
+            if SELF == M5:
+                p = subprocess.run(pool_cmd + ["move", sid, "--to", SHORT[dst]], capture_output=True, text=True, timeout=900)
+                ok, msg = p.returncode == 0, (p.stdout + p.stderr).strip()
+            else:
+                status, out = pool.peer(f"pool move {shlex.quote(sid)} --to {SHORT[dst]} 2>&1", timeout=900)
+                ok, msg = status == 0, out.strip()
+        else:
+            return False, "it isn't in a Ghostty tab or in the background, so pool can't move it"
+    except subprocess.TimeoutExpired:
+        return False, "the move timed out"
+    if ok:
+        pool.record_move(sid)
+    return ok, msg or ("moving it" if ok else "the move failed")
+
+
+def snoozed():
+    try:
+        d = json.loads(SNOOZED.read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in d.items() if v > time.time()}
+
+
+def snooze(keys, minutes):
+    """No popup about these for a while, on both Macs (whichever you're at shows the popups). A move suggestion's key
+    is its session's first 8 characters; cleanup items and "service" have their own."""
+    d = snoozed()
+    for k in keys:
+        d[k] = time.time() + minutes * 60
+    STATE.mkdir(parents=True, exist_ok=True)
+    SNOOZED.write_text(json.dumps(d))
+    pool.peer("mkdir -p ~/.local/state/pool && cat > ~/.local/state/pool/snoozed.json", input=json.dumps(d))
+
+
+def kill_tree(root, grace=5.0):
+    """Stop root and everything it started: SIGTERM root first (Claude shuts its own tools down), then what's left,
+    then SIGKILL whatever ignores that. Returns how many processes were running."""
+    procs = processes()
+    kids = collections.defaultdict(list)
+    for pid, p in procs.items():
+        kids[p[0]].append(pid)
+    tree, todo = [], [root]
+    while todo:
+        p = todo.pop()
+        tree.append(p)
+        todo += kids.get(p, [])
+
+    def alive(pids):
+        out = []
+        for p in pids:
+            try:
+                os.kill(p, 0)
+                out.append(p)
+            except OSError:
+                pass
+        return out
+
+    for step, sig, wait in ((0, signal.SIGTERM, grace), (1, signal.SIGTERM, 2.0), (2, signal.SIGKILL, 1.0)):
+        targets = alive([root] if step == 0 else tree)
+        if not targets:
+            break
+        for p in targets:
+            try:
+                os.kill(p, sig)
+            except OSError:
+                pass
+        deadline = time.time() + wait
+        while time.time() < deadline and alive(targets):
+            time.sleep(0.2)
+    return len(tree)
+
+
+def close_here(spec):
+    """Close one item on this Mac if it is still what was offered (same session and process, or the same adopted
+    process by start time), so a reused pid is never hit. Returns (ok, message)."""
+    f = (spec.split("|") + [""] * 7)[:7]
+    if f[1] == "session":
+        sid, pid, profile, kind, short_id = f[2], int(f[3] or 0), f[4] or "claude", f[5], f[6]
+        out = sh(pool.PREAMBLE + f"{profile} agents --json 2>/dev/null || echo '[]'")
+        try:
+            live = [a for a in json.loads(out or "[]") if a.get("sessionId") == sid and int(a.get("pid") or 0) == pid]
+        except ValueError:
+            live = []
+        if not live:
+            return True, f"{sid[:8]} had already ended"
+        if kind == "background" and short_id:
+            sh(pool.PREAMBLE + f"{profile} stop {shlex.quote(short_id)} 2>&1")
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    return True, f"stopped {sid[:8]}"
+                time.sleep(0.3)
+        kill_tree(pid)
+        return True, f"closed {sid[:8]}"
+    if f[1] == "procs":
+        pid, start = int(f[2] or 0), int(f[3] or 0)
+        p = processes().get(pid)
+        if not p or p[0] != 1 or abs((time.time() - p[4]) - start) > 15:
+            return True, f"process {pid} had already gone"
+        n = kill_tree(pid)
+        return True, f"closed process {pid}" + (f" and {n - 1} under it" if n > 1 else "")
+    return False, f"don't know how to close {spec!r}"
+
+
+def close(specs):
+    """Close items on either Mac (each runs where it lives). Returns (all ok, message)."""
+    here = [s for s in specs if pool.SHORT.get(s.split("|")[0]) == SELF]
+    there = [s for s in specs if s not in here]
+    results = [close_here(s) for s in here]
+    if there:
+        status, out = pool.peer("python3 ~/.local/bin/pool-top --close " + " ".join(shlex.quote(s) for s in there),
+                                timeout=180)
+        results.append((status == 0, out.strip() or f"no answer from the {LABEL[PEER]}"))
+    ok = all(r[0] for r in results)
+    return ok, "; ".join(r[1] for r in results if r[1])
+
+
+def using_this_mac(macs):
+    """Whether you're at this Mac rather than the other: the one whose keyboard or pointer moved last."""
+    here, there = macs.get(SELF, {}).get("hid"), macs.get(PEER, {}).get("hid")
+    if there is None:
+        return True
+    if here is None:
+        return False
+    return here < there or (here == there and SELF == M5)
+
+
+CLEANUP_EVERY = 1200   # seconds between cleanup popups
+TRANSFER_EVERY = 1200  # seconds between optional "run it on the other Mac for more power" popups
+
+
+class Popups:
+    """What to pop up, one at a time and only on the Mac you're using: service down for two minutes first; then a move
+    that has stood 30 s for a session between turns (a move cuts a turn off), at most one new one a minute (tidy-ups,
+    level 2, stay in the menu); then one batch of things nobody is using, at most every CLEANUP_EVERY. Snoozed items
+    are skipped."""
+
+    def __init__(self, now=None):
+        self.first, self.current, self.offered = {}, None, 0.0
+        self.batch, self.batch_at = None, -1e9
+        self.transfer_at = -1e9
+        self.service_since, self.started = None, now if now is not None else time.time()
+
+    def pick(self, v, here_active, snoozes, now):
+        """The move to pop up, or None. Urgent moves (level 0/1: home work stranded on the M1, an overloaded or
+        memory-short Mac) stand 30 s and wait until the session is between turns, so a move never cuts off a turn to
+        relieve load. Transfers for more power (level 2: a busy task that the other Mac would run faster, or idle work
+        that frees memory) stand 90 s and come at most every TRANSFER_EVERY; a busy one is offered with a warning that
+        the move restarts its current step."""
+        keys = {r["sid"] + ">" + r["dst"]: r for r in v["recs"]}
+        self.first = {k: self.first.get(k, now) for k in keys}
+        if not here_active:
+            return None
+        for k, r in keys.items():
+            transfer = r["level"] >= 2
+            if snoozes.get(r["sid"][:8], 0) > now or now - self.first[k] < (90 if transfer else 30):
+                continue
+            if r["busy"] and not transfer:            # an urgent move waits for the turn to end
+                continue
+            if transfer and k != self.current and now - self.transfer_at < TRANSFER_EVERY:
+                continue
+            if k != self.current:
+                if now - self.offered < 60:
+                    return None
+                self.current, self.offered = k, now
+                if transfer:
+                    self.transfer_at = now
+            return r
+        self.current = None
+        return None
+
+    def pick_cleanup(self, items, here_active, snoozes, now):
+        live = {i["key"]: i for i in items if snoozes.get(i["key"], 0) <= now}
+        if self.batch and not any(k in live for k in self.batch["keys"]):
+            self.batch = None
+        if self.batch:
+            return self.batch if here_active else None
+        if (not here_active or not live or now - self.started < 60 or now - self.batch_at < CLEANUP_EVERY
+                or now - self.offered < 60):
+            return None
+        chosen = list(live.values())[:6]
+        self.batch = {"key": f"close:{int(now)}", "keys": [i["key"] for i in chosen], "items": chosen}
+        self.batch_at = self.offered = now
+        return self.batch
+
+    def service_down(self, up, now):
+        """Seconds service's bridge has been down on the M1 (None while it runs or the M1 can't be reached)."""
+        self.service_since = (self.service_since or now) if up is False else None
+        return now - self.service_since if self.service_since is not None else None
+
+
+def service_load(v, host):
+    """(cores, bytes) for service's own process plus the sessions pinned to the M1 on host, or None if there are none."""
+    s = v["latest"].get(host) or {}
+    pinned = [r for r in v["sessions"] if r["host"] == host and r["pinned"]]
+    if not s.get("service") and not pinned:
+        return None
+    b = s.get("service") or {"cpu": 0.0, "rss": 0}
+    return b["cpu"] + sum(r["cpu5"] for r in pinned), b["rss"] + sum(r["rss"] for r in pinned)
+
+
+def short(text, n):
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def move_args(r):
+    return ["--move", r["sid"], r["where"], SHORT[r["dst"]]]
+
+
+def move_popup(r):
+    transfer = r["level"] >= 2
+    title = (f"Run this on the {LABEL[r['dst']]} for more power?" if r.get("kind") == "power"
+             else f"Free up the {LABEL[r['src']]}: move this to the {LABEL[r['dst']]}?" if transfer
+             else f"Move a Claude session to the {LABEL[r['dst']]}")
+    body = r["why"][0].upper() + r["why"][1:] + "."
+    if r["busy"]:
+        body += f" It's mid-step, so the move restarts that step on the {LABEL[r['dst']]}."
+    return {"key": r["sid"] + ">" + r["dst"], "mac": LABEL[r["dst"]], "title": title,
+            "name": r["name"] or r["sid"][:8], "body": body,
+            "button": f"Move to the {LABEL[r['dst']]}", "args": move_args(r),
+            "later": ["--snooze", r["sid"], "60"], "timeout": ["--snooze", r["sid"], "15"]}
+
+
+def cleanup_popup(batch):
+    items = batch["items"]
+    hosts = sorted({LABEL[i["host"]] for i in items})
+    lines = [f"• {short(i['label'], 38)} ({LABEL[i['host']]}): {i['detail']}" for i in items]
+    return {"key": batch["key"], "mac": hosts[0] if len(hosts) == 1 else "",
+            "title": "Close what nobody is using?" + (f" ({hosts[0]})" if len(hosts) == 1 else ""),
+            "name": f"{len(items)} idle {'thing' if len(items) == 1 else 'things'} holding {gb(sum(i['rss'] for i in items))}",
+            "body": "\n".join(lines) + "\nConversations are kept. service's own processes are never closed.",
+            "button": "Close them", "args": ["--close"] + [i["spec"] for i in items],
+            "later": ["--snooze-keys", "1440"] + batch["keys"], "timeout": ["--snooze-keys", "60"] + batch["keys"]}
+
+
+def service_popup(down_for):
+    return {"key": "service-down", "mac": "M1", "title": "service is down", "name": "service isn't running on the M1",
+            "body": f"Its Slack bridge has been down for {ago(down_for)}, so requests aren't being picked up. "
+                    "Restart it? (launchd usually brings it back by itself; this runs `pool service restart`.)",
+            "button": "Restart service", "args": ["--service-restart"],
+            "later": ["--snooze-keys", "30", "service"], "timeout": ["--snooze-keys", "10", "service"]}
+
+
+def menu_state(v, popup=None, live=()):
+    """The JSON line PoolBar draws: the menu bar title, the menu, the popup to show (if any), and the keys of popups
+    still worth showing (PoolBar closes one whose key has gone)."""
+    macs = v["macs"]
+    title = []
+    for h in (M5, OLD):
+        m = macs.get(h)
+        title.append({"label": LABEL[h], "pct": round(m["util_now"] * 100) if m else None,
+                      "mem": round(m["used"] / m["total"] * 100) if m else None,
+                      "cpuHot": bool(m and m["util"] >= CEILING[h]), "memHot": bool(m and m["level"] < MEM_TIGHT)})
+    lines = []
+    for h in (M5, OLD):
+        m, s = macs.get(h), v["latest"].get(h)
+        if not m:
+            lines.append(f"{LABEL[h]}: out of reach")
+            continue
+        mem = "ok" if m["level"] >= MEM_TIGHT else "tight" if m["level"] >= MEM_LOW else "low"
+        line = (f"{LABEL[h]}  CPU {m['util_now']:.0%} of capacity ({room(m, h):.0f} to spare) · "
+                f"RAM {m['used'] / GB:.1f} of {m['total'] / GB:.0f} GB, memory {mem}")
+        service = service_load(v, h)
+        if service:
+            line += f" · service and its sessions {cores(service[0])} cores, {gb(service[1])}"
+        lines.append(line)
+    snoozes = snoozed()
+    recs = [{"text": f"Move “{short(r['name'] or r['sid'][:8], 46)}” to the {LABEL[r['dst']]}", "why": r["why"],
+             "level": r["level"], "busy": r["busy"], "args": move_args(r), "key": r["sid"] + ">" + r["dst"],
+             "sid": r["sid"], "snoozed": r["sid"][:8] in snoozes} for r in v["recs"]]
+    by_sid = {r["sid"]: r for r in v["recs"]}
+    sessions = {}
+    for h in (M5, OLD):
+        rows = []
+        for s in sorted((s for s in v["sessions"] if s["host"] == h), key=lambda s: (s["pinned"], s["status"] != "busy", -s["units"])):
+            text = (f"{short(s['name'] or s['sid'][:8], 44)}   {s['status']} · {cores(s['cpu5'])} cores · {gb(s['rss'])}"
+                    f" · {s['tier']}{'' if s['auto'] else ' (yours)'}")
+            rows.append({"text": text, "sid": s["sid"], "pinned": s["pinned"], "tier": s["tier"], "auto": s["auto"],
+                         "why": s["why"], "suggested": s["sid"] in by_sid,
+                         "move": {"text": f"Move to the {LABEL[OTHER[h]]}" + (" (cuts off its turn)" if s["status"] == "busy" else ""),
+                                  "args": ["--move", s["sid"], s["where"], SHORT[OTHER[h]]]}
+                         if s["movable"] and not s["pinned"] else None})
+        sessions[LABEL[h]] = rows
+    idle = [{"text": f"Close “{short(i['label'], 44)}” on the {LABEL[i['host']]}", "detail": f"{i['detail']} · {i['note']}",
+             "args": ["--close", i["spec"]], "keep": ["--snooze-keys", "1440", i["key"]],
+             "keepWeek": ["--snooze-keys", "10080", i["key"]]}
+            for i in v["cleanup"] if snoozes.get(i["key"], 0) <= time.time()]
+    service = v.get("service")
+    palette = {LABEL[h]: pool.CONF["colors"].get(LABEL[h], "blue") for h in (M5, OLD)}
+    out = {"palette": palette, "title": title, "alert": sum(1 for r in v["recs"] if r["level"] <= 1), "count": len(v["recs"]),
+           "macs": lines, "recs": recs, "warnings": v["dups"] + ([v["imbalance"]] if v.get("imbalance") else []),
+           "sessions": sessions, "idle": idle, "closeAll": ["--close"] + [i["spec"] for i in v["cleanup"]
+                                                                          if snoozes.get(i["key"], 0) <= time.time()],
+           "link": v.get("link"),
+           "service": None if service is None else {"up": bool(service), "text": "service is running on the M1" if service
+                                              else "service isn't running on the M1"},
+           "popup": popup, "live": list(live)}
+    return out
+
+
+def agent(interval=2.0, count=None):
+    """--agent: a JSON line for PoolBar every interval seconds."""
+    if not os.environ.get("SSH_CONNECTION") and not os.environ.get("POOL_TOP_NO_TMUX"):
+        # From the desktop session, so sessions moved onto this Mac can sign in (see pool's POOL_TMUX).
+        pool.desktop_tmux_here()
+    feed, meta, popups = Feed(interval, publish=True), Meta(), Popups()
+    n = 0
+    while count is None or n < count:
+        feed.changed.wait(interval)  # a link change redraws at once
+        feed.changed.clear()
+        now = time.time()
+        v = view(feed, meta, now)
+        here, snoozes = using_this_mac(v["macs"]), snoozed()
+        down = popups.service_down(v["service"], now)
+        live = [r["sid"] + ">" + r["dst"] for r in v["recs"] if snoozes.get(r["sid"][:8], 0) <= now]
+        popup = None
+        if down is not None and down >= 120 and snoozes.get("service", 0) <= now:
+            live.append("service-down")
+            popup = service_popup(down) if here else None
+        if not popup:
+            pick = popups.pick(v, here, snoozes, now)
+            popup = move_popup(pick) if pick else None
+        batch = popups.pick_cleanup(v["cleanup"], here, snoozes, now)
+        if popups.batch:
+            live.append(popups.batch["key"])
+        if not popup and batch:
+            popup = cleanup_popup(batch)
+        try:
+            print(json.dumps(menu_state(v, popup, live)), flush=True)
+        except BrokenPipeError:
+            return
+        n += 1
+
+
+# --- text snapshot ---
+
+def wait_for_both(feed, seconds=10):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        with feed.lock:
+            if all(len(feed.hist[h]) >= 2 for h in (M5, OLD)):
+                return
+        time.sleep(0.3)
+
+
+def once():
+    feed, meta = Feed(1), Meta()
+    wait_for_both(feed)
+    time.sleep(1)
+    v = view(feed, meta)
+    for line in menu_state(v, None)["macs"]:
+        print(line)
+    for h in (M5, OLD):
+        s = v["latest"].get(h)
+        if s:
+            per = " · ".join(f"{name} " + " ".join(f"{s['cores'][i]:.0%}" for i in idx) for name, idx in s["clusters"])
+            print(f"  {LABEL[h]} cores: {per}")
+            print(f"  {LABEL[h]} busiest apps outside Claude: " + ", ".join(f"{n} {c:.1f}" for n, c, _ in s["apps"][:4]))
+    print("\nSuggested moves:" if v["recs"] else "\nSuggested moves: none")
+    for r in v["recs"]:
+        print(f"  [{r['level']}] {r['sid'][:8]} {short(r['name'], 50)}  {LABEL[r['src']]} -> {LABEL[r['dst']]}"
+              f"{' (when its turn ends)' if r['busy'] else ''}: {r['why']}")
+    for d in v["dups"]:
+        print(f"  !! {d}")
+    if v.get("imbalance"):
+        print(f"  i  {v['imbalance']}")
+    if v.get("service") is not None:
+        print("  service is running on the M1" if v["service"] else "  !! service isn't running on the M1")
+    if v.get("link"):
+        print("  link: " + v["link"]["text"])
+    print("\nIdle, nobody using it:" if v["cleanup"] else "\nIdle, nobody using it: nothing")
+    for i in v["cleanup"]:
+        print(f"  {LABEL[i['host']]} {i['kind']:9}{short(i['label'], 48):49} {i['detail']} · {i['note']}")
+    print(f"\n{'Mac':4}{'session':9}{'name':46}{'tier':7}{'state':9}{'CPU':>5}{'RAM':>9}{'idle':>6}  window")
+    for s in sorted(v["sessions"], key=lambda s: (s["host"] != M5, s["pinned"], -s["units"])):
+        print(f"{LABEL[s['host']]:4}{s['sid'][:8]:9}{short(s['name'], 44):46}{s['tier'] + ('' if s['auto'] else '*'):7}"
+              f"{s['status']:9}{cores(s['cpu5']):>5}{gb(s['rss']):>9}{ago(s['idle']):>6}  {s['window']}"
+              f"{'  pinned' if s['pinned'] else ''}")
+
+
+# --- the monitor ---
+
+BRAILLE = ((0x01, 0x08), (0x02, 0x10), (0x04, 0x20), (0x40, 0x80))  # dot bits by [row within the cell][column]
+BLOCKS = "▁▂▃▄▅▆▇█"
+SHADES = "░▒▓█"
+
+
+def buckets(hist, now, span, n, value, gap):
+    """value(entry) averaged over each of n equal slices of the last span seconds. An empty slice carries the previous
+    value on across gaps shorter than gap seconds, else is None (a gap in the line)."""
+    sums, counts = [0.0] * n, [0] * n
+    start = now - span
+    for e in hist:
+        if start <= e[0] <= now:
+            i = min(n - 1, int((e[0] - start) / span * n))
+            sums[i] += value(e)
+            counts[i] += 1
+    out, last, last_i = [], None, -1
+    for i in range(n):
+        if counts[i]:
+            last, last_i = sums[i] / counts[i], i
+            out.append(last)
+        elif last is not None and (i - last_i) * span / n <= gap:
+            out.append(last)
+        else:
+            out.append(None)
+    return out
+
+
+def smooth(values, k):
+    """Centred moving average over k columns (gaps stay gaps), so second-to-second noise doesn't hide the trend."""
+    if k <= 1:
+        return values
+    half, out = k // 2, []
+    for i, v in enumerate(values):
+        near = [p for p in values[max(0, i - half): i + half + 1] if p is not None]
+        out.append(sum(near) / len(near) if v is not None and near else None)
+    return out
+
+
+def plot(series, w, h, top=1.0):
+    """A braille line chart: series is [(values for 2*w dot columns, colour)]. Returns (dot bits, colour) per cell;
+    a cell two series share gets "mixed"."""
+    bits = [[0] * w for _ in range(h)]
+    owner = [[None] * w for _ in range(h)]
+    rows = h * 4
+    for values, colour in series:
+        prev = None
+        for x, v in enumerate(values[: 2 * w]):
+            if v is None:
+                prev = None
+                continue
+            y = rows - 1 - max(0, min(rows - 1, int(round(v / top * (rows - 1)))))
+            lo, hi = (y, y) if prev is None else (min(prev, y), max(prev, y))
+            for yy in range(lo, hi + 1):  # join to the previous point so steep changes stay one line
+                r, c = yy // 4, x // 2
+                bits[r][c] |= BRAILLE[yy % 4][x % 2]
+                owner[r][c] = colour if owner[r][c] in (None, colour) else "mixed"
+            prev = y
+    return bits, owner
+
+
+def span_text(secs):
+    return f"{secs // 60} min" if secs < 3600 else "hour"
+
+
+class Monitor:
+    MODES = ("cpu", "cores", "memory")
+    SPANS = (120, 300, 900, 1800, 3600)
+    TIER_CYCLE = ("auto", "home", "float", "m1")
+
+    def __init__(self, scr, feed, meta):
+        self.scr, self.feed, self.meta = scr, feed, meta
+        self.mode, self.span = 0, 1
+        self.cursor = None      # chart column the readout follows (the chart holds still meanwhile), None for live
+        self.frozen = None      # (now, history) while scrubbing
+        self.sel, self.top = 0, 0
+        self.expand, self.help = False, False
+        self.confirm = None     # the session row waiting for y
+        self.msg, self.msg_at = "", 0.0
+        self.rows, self.row_y = [], {}
+        self.chart_box = None   # (y, x, height, width) of the plot, for clicks
+        self.v = None
+        self.colors()
+
+    def colors(self):
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            bg = -1
+        except curses.error:
+            bg = curses.COLOR_BLACK
+        many = curses.COLORS >= 256
+        n = [0]
+
+        def pair(fg, fallback):
+            n[0] += 1
+            curses.init_pair(n[0], fg if many else fallback, bg)
+            return curses.color_pair(n[0])
+
+        self.c = {M5: pair(68, curses.COLOR_BLUE), OLD: pair(166, curses.COLOR_YELLOW),
+                  "muted": pair(245, curses.COLOR_WHITE), "faint": pair(238, curses.COLOR_WHITE),
+                  "ok": pair(71, curses.COLOR_GREEN), "warn": pair(178, curses.COLOR_YELLOW),
+                  "bad": pair(167, curses.COLOR_RED), "mixed": pair(252, curses.COLOR_WHITE)}
+        # one hue each, dark to bright, for the per-core heat map
+        self.ramp = {M5: [pair(c, curses.COLOR_BLUE) for c in (24, 31, 38, 81)],
+                     OLD: [pair(c, curses.COLOR_YELLOW) for c in (94, 130, 166, 214)]}
+        if not many:
+            self.c["faint"] |= curses.A_DIM
+            self.c["muted"] |= curses.A_DIM
+
+    def put(self, y, x, text, attr=0):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return x
+        text = text[: max(0, w - x - (1 if y == h - 1 else 0))]
+        try:
+            self.scr.addstr(y, x, text, attr)
+        except curses.error:
+            pass
+        return x + len(text)
+
+    def say(self, msg):
+        self.msg, self.msg_at = msg, time.time()
+
+    # drawing
+
+    def draw(self):
+        v = self.v = view(self.feed, self.meta)
+        scr = self.scr
+        scr.erase()
+        H, W = scr.getmaxyx()
+        if H < 16 or W < 60:
+            self.put(0, 0, "pool top needs at least 60x16; make the window bigger")
+            scr.refresh()
+            return
+        if self.help:
+            self.draw_help(H, W)
+            scr.refresh()
+            return
+        y = self.draw_title(v, W)
+        for h in (M5, OLD):
+            y = self.draw_mac(y, v, h)
+        rows = self.rows = self.table_rows(v)
+        snoozes = snoozed()
+        self.idle = [i for i in v["cleanup"] if snoozes.get(i["key"], 0) <= time.time()]
+        more = len(self.idle) - 3
+        notes = (v["recs"] + v["dups"]
+                 + (["service isn't running on the M1 (B restarts it)"] if v.get("service") is False else [])
+                 + ([{"info": v["imbalance"]}] if v.get("imbalance") else []) + self.idle[:3]
+                 + ([{"info": f"…and {more} more idle things holding {gb(sum(i['rss'] for i in self.idle[3:]))}; "
+                              "X closes everything listed as idle"}] if more > 0 else [])) or [None]
+        n_notes = min(len(notes), max(1, (H - y) // 8))
+        avail = H - y - (1 + 1 + n_notes + 3)        # gap, notes header, notes; detail, apps, footer
+        table = min(len(rows), 14) + 1
+        chart = max(8, min(avail - table, 34))
+        if self.MODES[self.mode] == "cores":
+            chart = max(chart, min(avail - 4, sum(s["ncpu"] for s in v["latest"].values()) + 5))
+        y = self.draw_chart(y, chart, W, v)
+        y = self.draw_notes(y, W, v, notes[:n_notes])
+        y = self.draw_table(y, H - y - 3, W, v, rows)
+        self.draw_detail(H - 3, W, v)
+        self.draw_apps(H - 2, W, v)
+        self.draw_footer(H - 1, W)
+        scr.refresh()
+
+    def draw_title(self, v, W):
+        x = self.put(0, 0, " pool top", curses.A_BOLD)
+        x = self.put(0, x, f" · M5 + M1 · {time.strftime('%H:%M:%S')}", self.c["muted"])
+        if self.feed.peer_note:
+            self.put(0, x + 2, self.feed.peer_note, self.c["warn"])
+        elif v.get("link"):
+            state = v["link"]["state"]
+            x = self.put(0, x + 3, "● ", self.c[{"cable": "ok", "moving": "warn", "wifi": "muted"}[state]])
+            self.put(0, x, {"cable": "linked by cable", "moving": "cable plugged in, moving off Wi-Fi",
+                            "wifi": "linked over Wi-Fi"}[state], self.c["muted"])
+        right = "? help · q quit"
+        self.put(0, W - len(right) - 1, right, self.c["muted"])
+        return 2
+
+    def bar(self, y, x, frac, width, colour, mark=None):
+        filled = max(0, min(width, int(round(frac * width))))
+        at = int(round(mark * width)) if mark is not None else -1
+        for i in range(width):
+            if i == at:
+                x = self.put(y, x, "┃", self.c["warn"] if frac >= mark else self.c["muted"])
+            else:
+                x = self.put(y, x, "█" if i < filled else "░", colour if i < filled else self.c["faint"])
+        return x
+
+    def draw_mac(self, y, v, h):
+        s, m = v["latest"].get(h), v["macs"].get(h)
+        x = self.put(y, 1, "●", self.c[h])
+        x = self.put(y, x + 1, LABEL[h], self.c[h] | curses.A_BOLD)
+        if not s:
+            self.put(y, x + 2, "out of reach" if h == PEER and self.feed.peer_note else "starting…", self.c["muted"])
+            return y + 3
+        x = self.put(y, x + 1, f" {s['chip'].replace('Apple ', ''):<7}", self.c["muted"])
+        x = self.put(y, x + 1, "CPU ", self.c["muted"])
+        x = self.bar(y, x, m["util_now"], 24, self.c[h], CEILING[h])
+        x = self.put(y, x, f" {m['util_now']:>4.0%}", curses.A_BOLD)
+        x = self.put(y, x, f" of capacity · {room(dict(m, util=m['util_now']), h):.1f} to spare of {m['capacity']:.1f}"
+                           f" · load {s['load'][0]:.1f}", self.c["muted"])
+        service = service_load(v, h)
+        if service:
+            self.put(y, x, f" · service + its sessions {cores(service[0])} cores, {gb(service[1])}", self.c["muted"])
+        y += 1
+        x, last = 4, None
+        for name, idx in s["clusters"]:  # fastest cores first, a space between clusters
+            if name != last:
+                x = self.put(y, x, f"{name} ", self.c["muted"])
+                last = name
+            for i in idx:
+                c = s["cores"][i]
+                x = self.put(y, x, BLOCKS[min(7, int(c * 8))] if c >= 0.03 else "▁", self.c[h] if c >= 0.03 else self.c["faint"])
+            x += 1
+        x = max(x + 1, 46)
+        x = self.put(y, x, "RAM ", self.c["muted"])
+        x = self.bar(y, x, m["used"] / m["total"], 16, self.c[h])
+        x = self.put(y, x, f" {m['used'] / GB:.1f}/{m['total'] / GB:.0f} GB", curses.A_BOLD)
+        x = self.put(y, x, f" · swap {m['swap'] / GB:.1f} GB · ", self.c["muted"])
+        state, colour = (("memory ok", "ok") if m["level"] >= MEM_TIGHT else ("memory tight", "warn")
+                         if m["level"] >= MEM_LOW else ("memory low", "bad"))
+        x = self.put(y, x, "● ", self.c[colour])
+        self.put(y, x, f"{state} ({m['level']}% free)", self.c["muted"])
+        return y + 2
+
+    def draw_chart(self, y, height, W, v):
+        mode = self.MODES[self.mode]
+        span = self.SPANS[self.span]
+        titles = {"cpu": "CPU, share of each Mac's capacity", "cores": "Each core, busy share",
+                  "memory": "Memory in use, share of RAM"}
+        x = self.put(y, 1, titles[mode], curses.A_BOLD)
+        self.put(y, x, f" · last {span_text(span)} · g next graph · +/- span · ←/→ or click to look back", self.c["muted"])
+        if mode != "cores":
+            lx = W - 14
+            for h in (M5, OLD):
+                lx = self.put(y, lx, "● ", self.c[h])
+                lx = self.put(y, lx, LABEL[h] + "  ", self.c["muted"])
+        if self.frozen:
+            now, hist = self.frozen
+        else:
+            now, hist = time.time(), {h: self.feed.history(h) for h in (M5, OLD)}
+        left, pw = 7, W - 9
+        ph = height - 3
+        top = y + 1
+        self.chart_box = (top, left, ph, pw)
+        gap = 3 * self.feed.interval + 1
+        readout = []
+        if mode in ("cpu", "memory"):
+            idx = 2 if mode == "cpu" else 3
+            k = int(round(5 / (span / (pw * 2))))  # about 5 s of samples per point
+            series = [(smooth(buckets(hist[h], now, span, pw * 2, lambda e: e[idx], gap), k), h) for h in (M5, OLD)]
+            bits, owner = plot(series, pw, ph)
+            dots = ph * 4 - 1
+            guides = {}
+            if mode == "cpu":  # the row each Mac's ceiling falls in, as plot() places values
+                for h in (M5, OLD):
+                    guides[(dots - int(round(CEILING[h] * dots))) // 4] = h
+            for r in range(ph):
+                if r in (0, ph - 1) or r == (ph - 1) // 2:
+                    frac = 1 - min(dots, r * 4 + (0 if r == 0 else 3 if r == ph - 1 else 1.5)) / dots
+                    self.put(top + r, 0, f"{frac:>5.0%} ", self.c["muted"])
+                self.put(top + r, left - 1, "┤" if r in (0, ph - 1, (ph - 1) // 2) else "│", self.c["faint"])
+                for c in range(pw):
+                    ch, attr = (chr(0x2800 + bits[r][c]), self.c[owner[r][c]]) if bits[r][c] else \
+                        (("┄", self.c["faint"]) if r in guides else (" ", 0))
+                    if c == self.cursor:
+                        attr |= curses.A_REVERSE
+                    self.put(top + r, left + c, ch, attr)
+                if r in guides:  # in the margin, so the newest data at the right edge stays visible
+                    self.put(top + r, 0, f"{LABEL[guides[r]]}{CEILING[guides[r]]:>4.0%}", self.c["muted"])
+            col = self.cursor if self.cursor is not None else pw - 1
+            for vals, h in series:
+                pts = [p for p in vals[col * 2: col * 2 + 2] if p is not None]
+                readout.append((h, f"{sum(pts) / len(pts):.0%}" if pts else "no data"))
+        else:
+            self.draw_heat(top, left, ph, pw, hist, now, span, gap)
+            col = self.cursor if self.cursor is not None else pw - 1
+            for h in (M5, OLD):
+                vals = buckets(hist[h], now, span, pw, lambda e: sum(e[1]) / max(1, len(e[1])), gap)
+                readout.append((h, f"{vals[col]:.0%} average" if vals and vals[col] is not None else "no data"))
+        axis = top + ph
+        self.put(axis, left, "└" + "─" * (pw - 1), self.c["faint"])
+        label_l = f"-{span_text(span)}"
+        mid = f"-{span // 120} min" if span >= 240 else f"-{span // 2} s"
+        self.put(axis + 1, left, label_l, self.c["muted"])
+        self.put(axis + 1, left + pw // 2 - len(mid) // 2, mid, self.c["muted"])
+        self.put(axis + 1, left + pw - 3, "now", self.c["muted"])
+        col = self.cursor if self.cursor is not None else pw - 1
+        when = now - span + (col + 0.5) * span / pw
+        x = self.put(axis + 2, left, ("at " if self.cursor is not None else "now ") + time.strftime("%H:%M:%S", time.localtime(when)),
+                     curses.A_BOLD if self.cursor is not None else self.c["muted"])
+        for h, text in readout:
+            x = self.put(axis + 2, x + 3, "● ", self.c[h])
+            x = self.put(axis + 2, x, f"{LABEL[h]} {text}")
+        if self.cursor is not None:
+            self.put(axis + 2, x + 3, "(paused while you look back; esc for live)", self.c["muted"])
+        return axis + 3
+
+    def draw_heat(self, top, left, ph, pw, hist, now, span, gap):
+        """One row per core (or per cluster, or per Mac, whatever fits), one hue per Mac, darker to brighter and
+        ░▒▓█ as the core gets busier."""
+        rows = []
+        for h in (M5, OLD):
+            s = self.v["latest"].get(h)
+            if not s:
+                continue
+            clusters_of = collections.Counter(name for name, _ in s["clusters"])
+            cores_seen, clusters_seen = collections.Counter(), collections.Counter()
+            per_core, per_cluster = [], []
+            for name, idx in s["clusters"]:  # rows "S0".."S5", or "Perf1", "Perf2" when there's less room
+                per_core += [(f"{name[0]}{cores_seen[name] + j}", [i]) for j, i in enumerate(idx)]
+                cores_seen[name] += len(idx)
+                clusters_seen[name] += 1
+                per_cluster.append((name[:4] + (str(clusters_seen[name]) if clusters_of[name] > 1 else ""), idx))
+            rows.append((h, per_core, per_cluster))
+        need = sum(len(pc) + 1 for _, pc, _ in rows)
+        r = 0
+        for h, per_core, per_cluster in rows:
+            if need <= ph:
+                lines = per_core
+            elif sum(len(c) + 1 for _, _, c in rows) <= ph:
+                lines = per_cluster
+            else:
+                lines = [("all", [i for _, idx in per_cluster for i in idx])]
+            self.put(top + r, 0, f" {LABEL[h]}", self.c[h] | curses.A_BOLD)
+            r += 1
+            for name, idx in lines:
+                if r >= ph:
+                    return
+                vals = buckets(hist[h], now, span, pw, lambda e, idx=idx: sum(e[1][i] for i in idx) / len(idx), gap)
+                self.put(top + r, 1, f"{name:>5}", self.c["muted"])
+                for c, val in enumerate(vals):
+                    if val is None or val < 0.05:
+                        ch, attr = ("·" if val is not None else " "), self.c["faint"]
+                    else:
+                        lvl = min(3, int(val * 4))
+                        ch, attr = SHADES[lvl], self.ramp[h][lvl]
+                    if c == self.cursor:
+                        attr |= curses.A_REVERSE
+                    self.put(top + r, left + c, ch, attr)
+                r += 1
+
+    def draw_notes(self, y, W, v, notes):
+        x = self.put(y, 1, "Suggested moves and cleanup", curses.A_BOLD)
+        self.put(y, x, " · m moves the selected session, x closes it, X closes all idle · PoolBar pops these up",
+                 self.c["muted"])
+        y += 1
+        for n in notes:
+            if n is None:
+                self.put(y, 3, "none: both Macs are within their limits, every session is where its tier puts it, and "
+                               "nothing has sat idle a day", self.c["muted"])
+            elif isinstance(n, str):
+                x = self.put(y, 2, "!! ", self.c["bad"])
+                self.put(y, x, n)
+            elif "info" in n:
+                x = self.put(y, 2, "i  ", self.c["muted"])
+                self.put(y, x, n["info"], self.c["muted"])
+            elif "spec" in n:
+                x = self.put(y, 2, "✕ ", self.c["muted"])
+                x = self.put(y, x, f"{short(n['label'], 36):<36} ")
+                x = self.put(y, x, LABEL[n["host"]], self.c[n["host"]])
+                self.put(y, x + 2, f"{n['detail']} · {n['note']}", self.c["muted"])
+            else:
+                mark, colour = (("!", "warn") if n["level"] == 0 else ("▲", "warn") if n["level"] == 1 else ("·", "muted"))
+                x = self.put(y, 2, mark + " ", self.c[colour])
+                x = self.put(y, x, f"{short(n['name'] or n['sid'][:8], 36):<36} ")
+                x = self.put(y, x, LABEL[n["src"]], self.c[n["src"]])
+                x = self.put(y, x, " → ", self.c["muted"])
+                x = self.put(y, x, LABEL[n["dst"]] + " ", self.c[n["dst"]] | curses.A_BOLD)
+                self.put(y, x + 1, n["why"] + (" (once its turn ends)" if n["busy"] else ""), self.c["muted"])
+            y += 1
+        return y
+
+    def table_rows(self, v):
+        rows = []
+        for h in (M5, OLD):
+            mine = [s for s in v["sessions"] if s["host"] == h]
+            pinned = [s for s in mine if s["pinned"]]
+            rows += sorted((s for s in mine if not s["pinned"]), key=lambda s: (s["status"] != "busy", -s["units"]))
+            if pinned and self.expand:
+                rows += sorted(pinned, key=lambda s: (s["status"] != "busy", -s["units"]))
+            elif pinned:
+                rows.append({"group": True, "host": h, "items": pinned, "sid": f"group-{h}"})
+        return rows
+
+    def draw_table(self, y, height, W, v, rows):
+        name_w = max(16, W - 78)
+        head = f"   Mac session  {'name':<{name_w}} tier   state     CPU    RAM  idle  window     move"
+        self.put(y, 0, head, self.c["muted"] | curses.A_UNDERLINE)
+        y += 1
+        height = max(1, height - 1)
+        self.sel = max(0, min(self.sel, len(rows) - 1))
+        if self.sel < self.top:
+            self.top = self.sel
+        if self.sel >= self.top + height:
+            self.top = self.sel - height + 1
+        recs = {r["sid"]: r for r in v["recs"]}
+        self.row_y = {}
+        for i, s in enumerate(rows[self.top: self.top + height]):
+            n = self.top + i
+            self.row_y[y] = n
+            sel = curses.A_REVERSE if n == self.sel else 0
+            suggested = not s.get("group") and s.get("sid") in recs   # a move is suggested for this session
+            self.put(y, 0, " " * (W - 1), sel)
+            # a ⇄ marker in the destination Mac's colour flags the session that would move
+            mark = "›" if n == self.sel else ("⇄" if suggested else " ")
+            mark_attr = sel if n == self.sel else (self.c[recs[s["sid"]]["dst"]] | curses.A_BOLD if suggested else 0)
+            x = self.put(y, 1, mark, mark_attr)
+            x = self.put(y, x + 1, f"{LABEL[s['host']]:<3}", self.c[s["host"]] | sel)
+            if s.get("group"):
+                items = s["items"]
+                busy = sum(1 for it in items if it["status"] == "busy")
+                text = f"service + pinned work: {len(items)} sessions pinned to the M1 ({busy} working) · b lists them"
+                x = self.put(y, x + 1, f"{'':8} {short(text, name_w):<{name_w}} ", sel)
+                x = self.put(y, x, f"{'m1':<6} {'':9}", self.c["muted"] | sel)
+                self.put(y, x, f"{cores(sum(it['cpu5'] for it in items)):>5} {gb(sum(it['rss'] for it in items)):>7}", sel)
+                y += 1
+                continue
+            x = self.put(y, x + 1, s["sid"][:8], self.c["muted"] | sel)
+            x = self.put(y, x + 1, f"{short(s['name'] or '(unnamed)', name_w):<{name_w}} ", sel | (curses.A_BOLD if suggested else 0))
+            x = self.put(y, x, f"{s['tier']:<6} ", (self.c["muted"] if s["auto"] else curses.A_BOLD) | sel)
+            state_attr = {"busy": curses.A_BOLD, "waiting": self.c["warn"]}.get(s["status"], self.c["muted"])
+            x = self.put(y, x, f"{s['status']:<8} ", state_attr | sel)
+            x = self.put(y, x, f"{cores(s['cpu5']):>5} {gb(s['rss']):>7} {ago(s['idle']):>5}  ", sel)
+            x = self.put(y, x, f"{s['window']:<10} ", self.c["muted"] | sel)
+            r = recs.get(s["sid"])
+            if r:
+                self.put(y, x, f"→ {LABEL[r['dst']]}", self.c["warn"] | curses.A_BOLD | sel)
+            y += 1
+        return y
+
+    def selected(self):
+        return self.rows[self.sel] if self.rows and 0 <= self.sel < len(self.rows) else None
+
+    def draw_detail(self, y, W, v):
+        s = self.selected()
+        if not s:
+            return
+        if s.get("group"):
+            self.put(y, 1, "the service's sessions and pinned work stay on the M1 (their data lives there); b lists them",
+                     self.c["muted"])
+            return
+        where = {"tab": f"its Ghostty tab is on the {LABEL[s['host']]}",
+                 "moved": f"runs on the {LABEL[s['host']]} for a window on the {LABEL[OTHER[s['host']]]}",
+                 "bg": "a background session", "tmux": "in a tmux session pool can't move",
+                 "ssh": "over ssh, which pool can't move", "other": "not in a Ghostty tab, so pool can't move it"}[s["where"]]
+        tier = f"{s['tier']} ({s['why']})"
+        text = (f"{s['sid'][:8]} · {tier} · {where} · {s['cwd'].replace(HOME, '~')}")
+        x = self.put(y, 1, short(text, W - 40), self.c["muted"])
+        keys = "t tier" + ("" if s["pinned"] else "") + (f" · m move to the {LABEL[OTHER[s['host']]]}" if s["movable"] and not s["pinned"] else "")
+        self.put(y, max(x + 3, W - len(keys) - 2), keys, self.c["muted"])
+
+    def draw_apps(self, y, W, v):
+        x = self.put(y, 1, "Busiest outside Claude ", self.c["muted"])
+        for h in (M5, OLD):
+            s = v["latest"].get(h)
+            if not s:
+                continue
+            x = self.put(y, x + 1, LABEL[h] + ":", self.c[h])
+            for name, cpu, rss in s["apps"][:4]:
+                x = self.put(y, x + 1, f"{short(name, 18)} {cpu:.1f}", self.c["muted"])
+            x += 2
+
+    def draw_footer(self, y, W):
+        if self.confirm:
+            self.put(y, 1, short(self.confirm[0] + "  y / n", W - 2), self.c["warn"] | curses.A_BOLD)
+        elif self.msg and time.time() - self.msg_at < 8:
+            self.put(y, 1, short(self.msg, W - 2), curses.A_BOLD)
+        else:
+            self.put(y, 1, "↑↓ select · t tier · m move · x close · X close idle · g graph · +/- span · ←→ look back · "
+                           "b service · ? help · q quit", self.c["muted"])
+
+    def draw_help(self, H, W):
+        lines = ("Tiers" + __doc__.split("Tiers", 1)[1]).splitlines()
+        keys = ["", "Keys", "  ↑ ↓ / j k / wheel   select a session          t   cycle its tier: auto, home, float, m1",
+                "  m                    move it to the other Mac (its window stays; /change-computer does the same)",
+                "  g                    CPU graph, per-core heat map, memory graph",
+                "  + -                  2, 5, 15, 30 or 60 minutes", "  ← → / click graph    look back (holds the graph still); esc for live",
+                "  x                    close the selected session (its conversation is kept)",
+                "  X                    close everything listed as idle: day-old sessions, processes no session owns",
+                "  B                    restart service when it's down",
+                "  b                    show service's and pinned work's pinned sessions", "  q                    quit", "",
+                "Session tiers marked bold are ones you set; grey ones are guesses (ticket work is home, background and",
+                "day-old sessions are m1). CPU is each session's 5-minute average in cores, with everything it started;",
+                "RAM includes its MCP servers and tools. Press any key to go back."]
+        for i, l in enumerate((lines + keys)[: H - 1]):
+            self.put(i, 1, l[: W - 2], curses.A_BOLD if l in ("Keys",) or l.startswith("Tiers") else 0)
+
+    # input
+
+    def key(self, k):
+        if self.help:
+            self.help = False
+            return True
+        if self.confirm:
+            (_, doing, run), self.confirm = self.confirm, None
+            if k in (ord("y"), ord("Y")):
+                self.say(doing)
+                threading.Thread(target=run, daemon=True).start()
+            else:
+                self.say("left it as it is")
+            return True
+        if k in (ord("q"), ord("Q")):
+            return False
+        if k == ord("?"):
+            self.help = True
+        elif k in (curses.KEY_DOWN, ord("j")):
+            self.sel += 1
+        elif k in (curses.KEY_UP, ord("k")):
+            self.sel = max(0, self.sel - 1)
+        elif k == curses.KEY_NPAGE:
+            self.sel += 10
+        elif k == curses.KEY_PPAGE:
+            self.sel = max(0, self.sel - 10)
+        elif k == ord("g"):
+            self.mode = (self.mode + 1) % len(self.MODES)
+        elif k in (ord("+"), ord("=")):
+            self.span = min(len(self.SPANS) - 1, self.span + 1)
+        elif k in (ord("-"), ord("_")):
+            self.span = max(0, self.span - 1)
+        elif k in (curses.KEY_LEFT, ord("h")):
+            self.look_back(-1 if self.cursor is not None else None)
+        elif k in (curses.KEY_RIGHT, ord("l")):
+            if self.cursor is not None:
+                self.look_back(1)
+        elif k == 27:
+            self.cursor, self.frozen = None, None
+        elif k == ord("b"):
+            self.expand = not self.expand
+        elif k == ord("t"):
+            self.cycle_tier()
+        elif k in (ord("m"), ord("M")):
+            self.ask_move()
+        elif k == ord("x"):
+            self.ask_close()
+        elif k == ord("X"):
+            self.ask_close_idle()
+        elif k == ord("B") and self.v and self.v.get("service") is False:
+            self.confirm = ("Restart service on the M1 (pool service restart)?", "restarting service…", self.restart_service)
+        elif k == curses.KEY_MOUSE:
+            self.mouse()
+        return True
+
+    def look_back(self, step):
+        if not self.chart_box:
+            return
+        _, _, _, pw = self.chart_box
+        if self.cursor is None:
+            self.freeze()
+            self.cursor = pw - 1
+        self.cursor += step or 0
+        if self.cursor >= pw:
+            self.cursor, self.frozen = None, None
+        else:
+            self.cursor = max(0, self.cursor)
+
+    def freeze(self):
+        self.frozen = (time.time(), {h: self.feed.history(h) for h in (M5, OLD)})
+
+    def mouse(self):
+        try:
+            _, x, y, _, state = curses.getmouse()
+        except curses.error:
+            return
+        up, down = getattr(curses, "BUTTON4_PRESSED", 0x80000), getattr(curses, "BUTTON5_PRESSED", 0x200000)
+        if state & up:
+            self.sel = max(0, self.sel - 1)
+        elif state & down:
+            self.sel += 1
+        elif self.chart_box and self.chart_box[0] <= y < self.chart_box[0] + self.chart_box[2] \
+                and self.chart_box[1] <= x < self.chart_box[1] + self.chart_box[3]:
+            if self.cursor is None:
+                self.freeze()
+            self.cursor = x - self.chart_box[1]
+        elif y in self.row_y:
+            self.sel = self.row_y[y]
+
+    def cycle_tier(self):
+        s = self.selected()
+        if not s or s.get("group"):
+            return
+        if s["pinned"]:
+            self.say("the service's sessions and pinned work are pinned to the M1")
+            return
+        cur = self.meta.chosen.get(s["sid"][:8], "auto")
+        nxt = self.TIER_CYCLE[(self.TIER_CYCLE.index(cur) + 1) % len(self.TIER_CYCLE)]
+        threading.Thread(target=self.meta.set_tier, args=(s["sid"], nxt), daemon=True).start()
+        self.meta.chosen = {**{k: t for k, t in self.meta.chosen.items() if k != s["sid"][:8]},
+                            **({s["sid"][:8]: nxt} if nxt != "auto" else {})}
+        self.say(f"{s['sid'][:8]}: tier " + (nxt if nxt != "auto" else "auto (pool guesses)"))
+
+    def ask_move(self):
+        s = self.selected()
+        if not s or s.get("group"):
+            return
+        if s["pinned"]:
+            self.say("the service's sessions and pinned work stay on the M1")
+        elif not s["movable"]:
+            self.say("pool can't move this one: " + ("it's running twice; close one copy first" if s["where"] in MOVABLE
+                                                      else "it isn't in a Ghostty tab or the background"))
+        else:
+            text = (f"Move {s['sid'][:8]} “{short(s['name'], 40)}” to the {LABEL[OTHER[s['host']]]}? Its window stays and "
+                    "reconnects; the conversation resumes there" + (", cutting off the turn it's on" if s["status"] == "busy" else "") + ".")
+            self.confirm = (text, f"moving {s['sid'][:8]} to the {LABEL[OTHER[s['host']]]}…", lambda: self.move(s))
+
+    def move(self, s):
+        ok, msg = do_move(s["sid"], s["where"], OTHER[s["host"]])
+        self.say(("" if ok else "couldn't move it: ") + msg.replace("pool: ", ""))
+
+    def ask_close(self):
+        s = self.selected()
+        if not s or s.get("group"):
+            return
+        spec = "|".join([SHORT[s["host"]], "session", s["sid"], str(s["pid"]), s.get("profile") or "claude", s["kind"],
+                         s.get("id") or ""])
+        text = (f"Close {s['sid'][:8]} “{short(s['name'], 40)}” on the {LABEL[s['host']]}? Its conversation is kept"
+                + (", but it's mid-turn" if s["status"] == "busy" else "") + ".")
+        self.confirm = (text, f"closing {s['sid'][:8]}…", lambda: self.close([spec]))
+
+    def ask_close_idle(self):
+        idle = getattr(self, "idle", [])
+        if not idle:
+            self.say("nothing has sat idle a day, and no process is left without its session")
+            return
+        text = (f"Close {len(idle)} idle things holding {gb(sum(i['rss'] for i in idle))} "
+                f"({', '.join(short(i['label'], 20) for i in idle[:3])}{'…' if len(idle) > 3 else ''})? "
+                "Conversations are kept; service's own processes are never closed.")
+        specs = [i["spec"] for i in idle]
+        self.confirm = (text, f"closing {len(idle)} idle things…", lambda: self.close(specs))
+
+    def close(self, specs):
+        ok, msg = close(specs)
+        self.say(("" if ok else "some didn't close: ") + msg)
+
+    def restart_service(self):
+        p = subprocess.run([sys.executable, POOL, "service", "restart"], capture_output=True, text=True)
+        self.say((p.stdout + p.stderr).strip().splitlines()[-1] if (p.stdout + p.stderr).strip() else "restarted service")
+
+    def run(self):
+        curses.curs_set(0)
+        self.scr.keypad(True)
+        self.scr.timeout(200)
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        curses.mouseinterval(0)
+        last = 0.0
+        while True:
+            if time.time() - last >= 1:
+                self.draw()
+                last = time.time()
+            k = self.scr.getch()
+            if k == -1:
+                continue
+            if k == curses.KEY_RESIZE:
+                last = 0
+                continue
+            if not self.key(k):
+                return
+            self.draw()
+            last = time.time()
+
+
+def monitor():
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    if not os.environ.get("SSH_CONNECTION") and not os.environ.get("POOL_TOP_NO_TMUX"):
+        pool.desktop_tmux_here()
+    feed, meta = Feed(1), Meta()
+    try:
+        curses.wrapper(lambda scr: Monitor(scr, feed, meta).run())
+    except KeyboardInterrupt:
+        pass
+
+
+def open_window():
+    ws = pool.workspace()
+    ws.osascript(f"tell {ws.GHOSTTY}\nnew window with configuration {{initial input:{ws.q('pool top')} & linefeed}}\nend tell")
+
+
+def main():
+    for k in [k for k in os.environ if k.startswith("CLAUDE")]:
+        del os.environ[k]
+    args = sys.argv[1:]
+    cmd = args[0] if args else ""
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+    elif cmd == "--stream":
+        stream(float(args[1]) if len(args) > 1 else 1.0)
+    elif cmd == "--agent":
+        agent(float(args[1]) if len(args) > 1 else 2.0, int(args[2]) if len(args) > 2 else None)
+    elif cmd == "--once":
+        once()
+    elif cmd == "--window":
+        open_window()
+    elif cmd == "--move" and len(args) == 4:
+        ok, msg = do_move(args[1], args[2], pool.SHORT[args[3]])
+        print(msg)
+        sys.exit(0 if ok else 1)
+    elif cmd == "--snooze" and len(args) == 3:
+        snooze([args[1][:8]], float(args[2]))
+    elif cmd == "--snooze-keys" and len(args) >= 3:
+        snooze(args[2:], float(args[1]))
+    elif cmd == "--close" and len(args) >= 2:
+        ok, msg = close(args[1:])
+        print(msg)
+        sys.exit(0 if ok else 1)
+    elif cmd == "--route-fix":
+        p = subprocess.run([sys.executable, POOL, "route", "--fix"], capture_output=True, text=True)
+        fixed = [l for l in p.stdout.splitlines() if l.startswith("fixed:")]
+        print(f"moved {len(fixed)} kind{'s' if len(fixed) != 1 else ''} of connection to the cable" if fixed
+              else "nothing to move" if "cable: up" in p.stdout else "the cable isn't answering")
+        sys.exit(p.returncode)
+    elif cmd == "--service-restart":
+        p = subprocess.run([sys.executable, POOL, "service", "restart"], capture_output=True, text=True)
+        print((p.stdout + p.stderr).strip() or "restarted service")
+        sys.exit(p.returncode)
+    elif cmd == "--tier" and len(args) == 3:
+        pool.set_tier(args[1], args[2])
+    elif not cmd:
+        monitor()
+    else:
+        sys.exit(f"pool top: unknown arguments {' '.join(args)!r}; see `pool top --help`")
+
+
+if __name__ == "__main__":
+    main()

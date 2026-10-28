@@ -1,0 +1,1587 @@
+#!/usr/bin/env python3
+"""Share work between your two Macs (set in ~/.config/pool/pool.json) so they act like one bigger computer.
+One Mac "travels" with you; the other "stays" put. Below, the stay Mac may run an optional always-on service.
+
+  pool                     load on both Macs, the Claude sessions on each, and sync health
+  pool watch               the same, live (every 2 s), with recent moves, commands sent to the
+                           other Mac and sync conflicts from both Macs' logs
+  pool run <command>       run a command in this directory on whichever Mac has more room;
+                           output streams back and pool exits with the command's status
+                           (--here or --there to choose)
+  pool claude [args]       start a Claude session on the Mac with more room and attach to it
+  pool move <session> [--to m5|old]   move a Claude session to the other Mac
+  pool balance [--dry-run] move idle background sessions off an overloaded Mac now
+  pool pin <session>       never move this session (an always-on service's sessions are always pinned)
+  pool tier <session> [home|stay|float|auto]   where a session belongs: home keeps it on the Mac that goes home
+                           with you, stay on the always-on Mac, float wherever there's room; auto (the default)
+                           guesses from what it is. Without a tier, prints the current one
+  pool route [--fix]       whether the Thunderbolt cable is up and which route every connection between the Macs
+                           takes (cable or Wi-Fi); --fix moves the ones on Wi-Fi onto the cable now (the daemon does
+                           this by itself within a minute of the cable answering)
+  pool top                 live per-core CPU and memory graphs for both Macs, every Claude session's CPU and
+                           memory, and which ones to move where (keys move them and set tiers)
+  pool home                on the M5: open windows here for sessions that run on the M5 but are only
+                           shown on the old Mac (happens by itself a minute after the old Mac drops out
+                           of reach). Nothing on the old Mac is stopped: it keeps running service and its
+                           sessions, and the M5's windows for those reconnect when it's reachable
+  pool service [logs|restart]   the always-on service on the stay Mac: status (default), recent log, or restart
+  pool daemon              the always-on loop (launchd runs it on the M5): measures both Macs
+                           every 15 s, writes the numbers the hook reads, rebalances, and settles
+                           sync conflicts
+  pool hook                Claude Code PreToolUse hook for Bash: when this Mac is overloaded and
+                           the other has room, heavy commands (type checks, lint, builds; tests
+                           only on the old Mac, which runs the Docker test databases) run there
+
+Files under ~/code are the same on both Macs (Mutagen keeps them in sync both ways), so a
+command or a Claude session can run on either. node_modules and other caches are per Mac.
+Nothing that is already running moves mid-way: commands are placed when they start, and only
+background sessions that are idle (between turns) are moved. Interactive sessions stay put.
+"""
+
+import importlib.machinery
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = str(Path.home())
+STATE = Path(HOME, ".local/state/pool")
+PINS = Path(HOME, ".config/pool/pins")
+TIERS = Path(HOME, ".config/pool/tiers.json")
+
+# Everything that differs between setups comes from pool_config (which falls back to the reference setup), so the same
+# code runs for anyone. M5 = the "travel" Mac (goes home with you), OLD = the "stay" Mac (always on); these are just
+# keys — the labels you see ("M5"/"M1", or whatever a teammate names them) come from the config.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pool_config  # noqa: E402
+CONF = pool_config.CONF
+SYNC_ROOT = CONF["sync_root"]
+M5, OLD = CONF["travel_host"], CONF["stay_host"]
+NAMES = CONF["names"]
+SHORT = CONF["short"]
+ALIAS = CONF["alias"]
+SPEED = CONF["speed"]
+TESTS_ON = CONF["tests_on"]
+SERVICE_STATE = (CONF["always_on"] or {}).get("state")
+SERVICE_LABEL = (CONF["always_on"] or {}).get("label")
+# Folders whose sessions never move (an always-on service's work, and anything pinned in config).
+OLD_MAC_WORK = list(CONF["pinned"])
+# Homebrew isn't on PATH for ssh commands, and Ghostty's terminal type (xterm-ghostty) is only described inside
+# Ghostty.app, so tmux over ssh needs pointing at it ("open terminal failed: terminal does not support clear").
+PREAMBLE = ('export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" '
+            'TERMINFO_DIRS="/Applications/Ghostty.app/Contents/Resources/terminfo:$TERMINFO_DIRS"; ')
+INTERVAL = 15
+q = shlex.quote
+
+# A command line goes to the other Mac only if every part of it (split on && || ; |) is one of these, and at
+# least one part is heavy or a test run. Anything else (git, curl, docker, servers, watch modes) stays here.
+RUNNER = r"(npx |pnpm (exec |dlx )?|yarn )?"
+SCRIPT = r"(pnpm|yarn|npm)( run| --filter \S+| -F \S+| -C \S+| --dir \S+)* "
+HEAVY = re.compile(rf"^({RUNNER}(tsc|vue-tsc|eslint|oxlint)|{SCRIPT}(typecheck|type-check|tsc|lint|build)"
+                   r"|(npx )?nx (run-many|affected|build|lint|typecheck)|(npx )?turbo (run )?(build|lint|typecheck)"
+                   r"|\S*quick-checks\.sh)(\s|$)")
+TESTS = re.compile(rf"^({RUNNER}(jest|vitest|pytest)|{SCRIPT}test(:[\w-]+)?|python3? -m pytest)(\s|$)")
+HARMLESS = re.compile(r"^(cd\s|export\s|(tail|head|grep|egrep|sort|uniq|wc|tee|cat|sed|awk|cut|tr|jq)(\s|$))")
+NEVER = re.compile(r"--watch|&\s*$")
+
+
+def die(msg):
+    print(f"pool: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def note(msg):
+    print(f"pool: {msg}", file=sys.stderr)
+
+
+def me():
+    return subprocess.run(["scutil", "--get", "LocalHostName"], capture_output=True, text=True).stdout.strip()
+
+
+SELF = me()
+PEER = OLD if SELF == M5 else M5
+
+
+def peer(script, input=None, timeout=30):
+    """Run script on the other Mac. Return (status, stdout)."""
+    try:
+        p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ALIAS[PEER],
+                            "bash -c " + q(PREAMBLE + script)], input=input, capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    return p.returncode, p.stdout
+
+
+def sysctl(name):
+    return subprocess.run(["sysctl", "-n", name], capture_output=True, text=True).stdout.strip()
+
+
+def measure():
+    host = me()
+    load1, load5, _ = os.getloadavg()
+    cores = int(sysctl("hw.ncpu"))
+    first = int(sysctl("hw.perflevel0.logicalcpu") or cores)
+    speed, tier2 = SPEED.get(host, (1.0, 0.5))
+    return {"host": host, "load1": round(load1, 2), "load5": round(load5, 2), "cores": cores,
+            "capacity": round(first * speed + (cores - first) * speed * tier2, 1),
+            "mem_free": int(sysctl("kern.memorystatus_level") or 100), "ts": round(time.time())}
+
+
+def busy(m):
+    """Runnable threads per core: 1.0 means every core is taken."""
+    return m["load1"] / m["cores"]
+
+
+def room(m):
+    """Idle capacity, in old-Mac performance cores."""
+    return max(0.0, 1 - busy(m)) * m["capacity"]
+
+
+def overloaded(m):
+    return busy(m) >= 1.0 or m["mem_free"] < 15
+
+
+def measure_both():
+    loads = {SELF: measure()}
+    status, out = peer("pool _measure", timeout=15)
+    if status == 0 and out.strip():
+        loads[PEER] = json.loads(out)
+    return loads
+
+
+def cached_loads(max_age=60):
+    """The numbers the daemon wrote in the last minute, or None."""
+    try:
+        d = json.loads((STATE / "load.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if time.time() - min(m["ts"] for m in d["loads"].values()) > max_age or len(d["loads"]) < 2:
+        return None
+    return d
+
+
+def choose(loads, tests=False):
+    """Which Mac new work should run on: this one unless it's busy and the other has clearly more room."""
+    a, b = loads.get(SELF), loads.get(PEER)
+    if not b or (tests and PEER not in TESTS_ON) or b["mem_free"] < 25:
+        return SELF
+    if busy(a) < 0.7 and a["mem_free"] >= 20:
+        return SELF
+    return PEER if room(b) > room(a) * 1.25 + 1 and busy(b) < 0.8 else SELF
+
+
+# --- live sync (Mutagen runs on the M5) ---
+
+def sync_sessions():
+    if SELF != M5:
+        status, out = peer("pool _sync-json", timeout=20)
+        return json.loads(out) if status == 0 and out.strip() else []
+    try:
+        out = subprocess.run(["mutagen", "sync", "list", "--template", "{{json .}}"],
+                             capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return json.loads(out or "[]")
+
+
+def healthy(s):
+    """Connected, not halted and no conflicts. A session mid-scan or mid-transfer is fine: flush waits for it."""
+    return (s["alpha"].get("connected") and s["beta"].get("connected") and not s.get("paused")
+            and not s.get("conflicts") and not str(s.get("status", "")).startswith(("halted", "disconnected"))
+            and "-seed" not in s["name"])
+
+
+def synced_roots(sessions):
+    return sorted(s["beta"]["path"] for s in sessions if healthy(s))
+
+
+def covering(path, roots):
+    return next((r for r in roots if path == r or path.startswith(r + "/")), None)
+
+
+def flush(path):
+    """Wait until changes under path on either Mac have crossed over. False if path isn't live-synced."""
+    if SELF != M5:
+        status, _ = peer(f"pool _flush {q(path)}", timeout=600)
+        return status == 0
+    name = next((s["name"] for s in sync_sessions() if healthy(s) and covering(path, [s["beta"]["path"]])), None)
+    if not name:
+        return False
+    return subprocess.run(["mutagen", "sync", "flush", name], capture_output=True, timeout=600).returncode == 0
+
+
+# --- running commands ---
+
+def parts(line):
+    """The simple commands in a shell line, each without leading VAR=value assignments or `time`."""
+    out = []
+    for seg in re.split(r"&&|\|\||;|\||\n", line):
+        seg = seg.strip().lstrip("(").rstrip(")").strip()
+        seg = re.sub(r"^((\w+=\S*|time)\s+)+", "", seg)
+        if seg:
+            out.append(seg)
+    return out
+
+
+def is_test(line):
+    return any(TESTS.match(p) for p in parts(line))
+
+
+def offloadable(line):
+    ps = parts(line)
+    if not ps or NEVER.search(line):
+        return False
+    # Output written outside the synced folders (say /tmp) would land on the other Mac, out of reach here.
+    for target in re.findall(r"(?:>>?|\btee\s+(?:-a\s+)?)\s*([^\s;&|)]+)", line):
+        if target.startswith(("/", "~")) and target != "/dev/null" and not covering(os.path.expanduser(target), [SYNC_ROOT]):
+            return False
+    return (all(HEAVY.match(p) or TESTS.match(p) or HARMLESS.match(p) for p in ps)
+            and any(HEAVY.match(p) or TESTS.match(p) for p in ps))
+
+
+REMOTE_GUARD = """
+import os, signal, subprocess, sys, threading
+os.chdir(sys.argv[1])
+p = subprocess.Popen(["zsh", "-lc", sys.argv[2]], stdin=subprocess.DEVNULL, start_new_session=True)
+def watch():
+    while os.read(0, 4096):
+        pass
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+threading.Thread(target=watch, daemon=True).start()
+code = p.wait()
+sys.exit(code if code >= 0 else 128 - code)
+"""
+
+
+def run_there(cwd, line, tty):
+    """Run line in cwd on the other Mac, streaming output. Return its status, or None if it can't go there."""
+    if not flush(cwd):
+        return None
+    if tty:
+        status = subprocess.run(["ssh", "-t", ALIAS[PEER], f"cd {q(cwd)} && zsh -lc {q(line)}"]).returncode
+    else:
+        # No terminal to carry a hangup, so the remote side stops the command's whole process group when
+        # this end goes away: its stdin, which this process holds open, reaches end of file.
+        proc = subprocess.Popen(["ssh", ALIAS[PEER], f"python3 -c {q(REMOTE_GUARD)} {q(cwd)} {q(line)}"],
+                                stdin=subprocess.PIPE)
+        status = proc.wait()
+    flush(cwd)
+    return status
+
+
+def run(args):
+    where, from_hook = "auto", False
+    while args[:1] in (["--here"], ["--there"], ["--hook"]):
+        flag = args.pop(0)
+        if flag == "--hook":
+            from_hook = True
+        else:
+            where = flag[2:]
+    if args[:1] == ["--"]:
+        args.pop(0)
+    if not args:
+        die("run what? e.g. `pool run pnpm test`")
+    line = args[0] if len(args) == 1 else " ".join(q(a) for a in args)
+    cwd = os.getcwd()
+    target = SELF
+    if where == "there":
+        target = PEER
+    elif where == "auto":
+        d = cached_loads()
+        target = choose(d["loads"] if d else measure_both(), tests=is_test(line))
+    if target == PEER:
+        tty = sys.stdin.isatty() and sys.stdout.isatty()
+        if not from_hook or tty:
+            note(f"running on {NAMES[PEER]}")
+        start = time.time()
+        status = run_there(cwd, line, tty)
+        if status is not None:
+            log(f"ran on {NAMES[PEER]}{' (hook)' if from_hook else ''}: {line[:80]} in "
+                f"{os.path.relpath(cwd, SYNC_ROOT) if covering(cwd, [SYNC_ROOT]) else cwd} "
+                f"({time.time() - start:.0f}s, exit {status})")
+            return status
+        if where == "there" and not from_hook:
+            die(f"{cwd} isn't kept in sync with {NAMES[PEER]} (only ~/code is), so it can't run there")
+    os.execvp("zsh", ["zsh", "-c", line])
+
+
+def hook():
+    """PreToolUse: rewrite a heavy Bash command to run on the other Mac. Print nothing to leave it alone."""
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        return
+    tool_input = data.get("tool_input") or {}
+    line = tool_input.get("command") or ""
+    cwd = data.get("cwd") or os.getcwd()
+    if data.get("tool_name") != "Bash" or not offloadable(line):
+        return
+    d = cached_loads()
+    if not d or not covering(cwd, d.get("synced", [])):
+        return
+    loads = d["loads"]
+    a, b = loads[SELF], loads[PEER]
+    if busy(a) < 0.85 or choose(loads, tests=is_test(line)) != PEER:
+        return
+    top = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
+    if top and os.path.exists(os.path.join(top, "package.json")):
+        status, _ = peer(f"test -d {q(top)}/node_modules", timeout=5)
+        if status != 0:
+            return  # not installed there; running it would only fail
+    updated = dict(tool_input, command=f"pool run --there --hook -- {q(line)}")
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "updatedInput": updated,
+        "additionalContext": (f"pool ran this command on {NAMES[PEER]} (same files, kept in sync) because "
+                              f"{NAMES[SELF]} is busy: load {a['load1']} on {a['cores']} cores there vs "
+                              f"{b['load1']} on {b['cores']} here. Output and exit status are the command's own."),
+    }}))
+
+
+# --- sessions ---
+
+def service_sessions():
+    """Ids of the sessions the always-on service owns; moving one would make it start a duplicate. Empty when there
+    is no always-on service configured."""
+    if not SERVICE_STATE:
+        return set()
+    script = f"cat {q(SERVICE_STATE)} 2>/dev/null || echo '{{}}'"
+    out = Path(SERVICE_STATE).read_text() if SELF == OLD and Path(SERVICE_STATE).exists() else peer(script)[1]
+    try:
+        state = json.loads(out or "{}")
+    except ValueError:
+        return set()
+    return {v["sessionId"][:8] for v in state.values() if isinstance(v, dict) and v.get("sessionId")}
+
+
+def pinned():
+    """Session ids (first 8 characters) and folders whose sessions never move: service's sessions, the folders of
+    the service's and pinned work (their data stays on the old Mac), and anything listed in ~/.config/pool/pins."""
+    pins = PINS.read_text().split() if PINS.exists() else []
+    ids = {p[:8] for p in pins if not p.startswith("/")} | service_sessions()
+    return ids | set(OLD_MAC_WORK) | {p.rstrip("/") for p in pins if p.startswith("/")}
+
+
+# Where a session belongs, whatever the load: home sessions run on the M5, which goes home with Nick; m1 sessions
+# are the unimportant ones and run on the M1, which stays at the office running service; float goes where there's room.
+TIER_NAMES = ("home", "float", "m1")
+TIER_HOST = {"home": M5, "m1": OLD}
+
+
+def chosen_tiers():
+    """{session id (8 characters): tier} for the sessions Nick gave a tier (`pool tier`, or t in `pool top`)."""
+    try:
+        d = json.loads(TIERS.read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in d.items() if v in TIER_NAMES}
+
+
+def set_tier(sid, tier):
+    """Give session sid a tier on both Macs, or with "auto" go back to the guess."""
+    status, out = peer("cat ~/.config/pool/tiers.json 2>/dev/null")
+    try:
+        d = {**(json.loads(out) if status == 0 and out.strip() else {}), **chosen_tiers()}
+    except ValueError:
+        d = chosen_tiers()
+    if tier == "auto":
+        d.pop(sid[:8], None)
+    else:
+        d[sid[:8]] = tier
+    TIERS.parent.mkdir(parents=True, exist_ok=True)
+    TIERS.write_text(json.dumps(d, indent=1))
+    peer("mkdir -p ~/.config/pool && cat > ~/.config/pool/tiers.json", input=TIERS.read_text())
+
+
+def tier_of(sid, name="", cwd="", kind="", idle_for=None, pins=None, chosen=None):
+    """(tier, why) for a session. Pinned work is m1, then the tier Nick chose, then a guess: background sessions
+    and ones idle for a day are m1, ticket work (ENG-123 in the name) is home, the rest float."""
+    pins = pinned() if pins is None else pins
+    chosen = chosen_tiers() if chosen is None else chosen
+    if sid[:8] in pins or covering(cwd or "", [p for p in pins if p.startswith("/")]):
+        return "m1", "service or pinned work, pinned to the M1"
+    if sid[:8] in chosen:
+        return chosen[sid[:8]], "set by you"
+    if kind == "background":
+        return "m1", "background session"
+    if re.search(r"\bENG-\d+", name or "", re.I):
+        return "home", "ticket work"
+    if idle_for is not None and idle_for >= 86400:
+        return "m1", "idle a day or more"
+    return "float", "goes where there's room"
+
+
+def allowed_on(tier, host):
+    return TIER_HOST.get(tier, host) == host
+
+
+def agents_on(host):
+    """[(profile, session dict)] on host, from `claude agents --json` (locally, or over ssh for the other Mac)."""
+    script = PREAMBLE + "claude agents --json 2>/dev/null || echo '[]'"
+    out = (subprocess.run(["bash", "-c", script], capture_output=True, text=True).stdout if host == SELF
+           else peer(script)[1])
+    try:
+        return [("claude", s) for s in json.loads(out or "[]")]
+    except ValueError:
+        return []
+
+
+def all_sessions():
+    """{host: [(profile, agents entry)]} for both Macs."""
+    return {SELF: agents_on(SELF), PEER: agents_on(PEER)}
+
+
+def recently_moved(sid, within=1800):
+    try:
+        moves = json.loads((STATE / "moves.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return time.time() - moves.get(sid[:8], 0) < within
+
+
+def record_move(*ids):
+    """Remember a move by short id: the session's own, and the new one if resuming forked it."""
+    try:
+        moves = json.loads((STATE / "moves.json").read_text())
+    except (OSError, ValueError):
+        moves = {}
+    for i in ids:
+        moves[i[:8]] = time.time()
+    STATE.mkdir(parents=True, exist_ok=True)
+    (STATE / "moves.json").write_text(json.dumps(moves))
+
+
+def log(msg):
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(STATE / "pool.log", "a") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+
+
+def notify(msg):
+    log(msg)
+    subprocess.run(["osascript", "-e", f"display notification {json.dumps(msg)} with title \"pool\""],
+                   capture_output=True)
+
+
+# A moved session resumes with no one at the keyboard, so it can't answer "N new MCP servers found in this
+# project" (~/code/.mcp.json); enable the project's servers for that launch instead of stalling on it.
+RESUME_SETTINGS = "--settings " + q(json.dumps({"enableAllProjectMcpServers": True}))
+
+
+def launch_here(cwd, profile, sid, prompt=""):
+    """Resume sid as a background session on the M5 (in tmux where --bg refuses, e.g. the home directory).
+    prompt is an already-quoted first message, or empty."""
+    out = subprocess.run(["bash", "-c", f"cd {q(cwd)} && {profile} --bg --resume {sid} {RESUME_SETTINGS} {prompt} 2>&1 || true"],
+                         capture_output=True, text=True).stdout
+    started = re.search(r"backgrounded · ([0-9a-f]+)", out)
+    if started:
+        return started.group(1)
+    if "not trusted" not in out:
+        raise RuntimeError(f"claude --bg failed: {out.strip()}")
+    subprocess.run(["tmux", "new", "-d", "-s", f"claude-{sid[:8]}", "-c", cwd,
+                    PREAMBLE + f"exec {profile} --resume {sid} {RESUME_SETTINGS} {prompt}"], check=True)
+    return sid[:8]
+
+
+def continue_prompt(src, dst):
+    return (f"[pool] This session was just moved from {NAMES[src]} to {NAMES[dst]} to balance load, which cut off "
+            "the step you were on. Files and git are the same on both Macs, but processes you started there "
+            "(background tasks, servers, a command still running) are gone. Check what finished, then carry on "
+            "with the task.")
+
+
+def launch_there(cwd, profile, sid, prompt=""):
+    """Resume sid as a background session on the other Mac, in its login-session tmux (so it can read the keychain)."""
+    if not desktop_tmux_on_peer():
+        raise RuntimeError(f"no login-session tmux on {NAMES[PEER]} to resume into (see SETUP.md)")
+    inner = PREAMBLE + f"cd {q(cwd)} && exec {profile} --resume {sid} {RESUME_SETTINGS} {prompt}"
+    peer(f"{POOL_TMUX} new -d -s claude-{sid[:8]} -c {q(cwd)} {q(inner)}")
+    return sid[:8]
+
+
+def move(sid, to):
+    """Move a background session to host `to`: stop it where it runs, then resume it on `to`. The files and the
+    transcript are already on both Macs (Mutagen sync), so nothing is copied. A session moved mid-turn is told to
+    pick up where it was cut off. Runs from the M5 (the Mac with the sync daemon)."""
+    if SELF != M5:
+        die("moves run from the M5")
+    src = OTHER_OF[to]
+    entry = next((s for _, s in agents_on(src) if (s.get("sessionId") or "").startswith(sid)), None)
+    if not entry:
+        die(f"session {sid} isn't running on {NAMES[src]}")
+    sid = entry["sessionId"]
+    cwd = session_cwd(sid) or entry.get("cwd") or HOME
+    prompt = q(continue_prompt(src, to)) if entry.get("status") == "busy" else ""
+    short = entry.get("id") or sid[:8]
+    stop = PREAMBLE + f"claude stop {short} 2>/dev/null || true"
+    subprocess.run(["bash", "-c", stop], capture_output=True) if src == SELF else peer(stop)
+    flush_session_files(cwd)
+    target = launch_here(cwd, "claude", sid, prompt) if to == M5 else launch_there(cwd, "claude", sid, prompt)
+    record_move(sid, target)
+    return sid, cwd, target
+
+
+def candidates(sessions, roots, pins, dst=None):
+    """Background sessions that are running and idle between turns, in a synced checkout, not pinned or just moved,
+    and (given dst) whose tier lets them run there.
+
+    `claude agents` reports a live process's `status` (busy/idle); `state` (working/blocked/done) is the agent
+    view's last word on the turn and stays on entries whose process is gone, so it isn't used.
+    """
+    out = []
+    for profile, s in sessions:
+        sid = s.get("sessionId") or ""
+        if (s.get("kind") == "background" and s.get("pid") and s.get("status") == "idle" and sid
+                and sid[:8] not in pins and not covering(s.get("cwd", ""), [p for p in pins if p.startswith("/")])
+                and covering(s.get("cwd", ""), roots) and not recently_moved(sid)
+                and (dst is None or allowed_on(tier_of(sid, s.get("name"), s.get("cwd"), s.get("kind"), None, pins)[0], dst))):
+            out.append(s)
+    return out
+
+
+def balance(loads=None, dry_run=False, limit=2):
+    """Move idle background sessions off an overloaded Mac onto one with room. Return what moved."""
+    loads = loads or measure_both()
+    if len(loads) < 2:
+        return []
+    src = next((h for h in (M5, OLD) if overloaded(loads[h])), None)
+    dst = OLD if src == M5 else M5
+    if not src or overloaded(loads[dst]) or busy(loads[dst]) > 0.7 or loads[dst]["mem_free"] < 30:
+        return []
+    roots = synced_roots(sync_sessions())
+    picks = candidates(all_sessions()[src], roots, pinned(), dst)[:limit]
+    moved = []
+    for s in picks:
+        what = f"{s['sessionId'][:8]} ({s.get('name') or s.get('cwd')})"
+        if dry_run:
+            print(f"would move {what} from {NAMES[src]} to {NAMES[dst]}")
+            continue
+        try:
+            move(s["sessionId"], dst)
+        except (SystemExit, RuntimeError, subprocess.SubprocessError) as e:
+            log(f"move of {what} to {NAMES[dst]} failed: {e}")
+            continue
+        notify(f"Moved idle session {what} from {NAMES[src]} to {NAMES[dst]}: {NAMES[src]} is overloaded.")
+        moved.append(s["sessionId"])
+    tab = auto_tab(src, dst, pinned(), dry_run)
+    return moved + ([tab] if tab else [])
+
+
+# --- Ghostty tabs: keep the window where it is, run its work on the other Mac ---
+
+def workspace():
+    """~/.claude/scripts/ghostty-workspace.py as a module: it maps Claude sessions to Ghostty panes."""
+    return importlib.machinery.SourceFileLoader("ghostty_workspace",
+                                                HOME + "/.claude/scripts/ghostty-workspace.py").load_module()
+
+
+def type_into(tty, text):
+    """Type text plus Enter into the Ghostty pane showing tty on this Mac. False if the pane isn't found."""
+    ws = workspace()
+    split = ws.mark_ttys([tty], ws.terminals() or []).get(tty)
+    if not split:
+        return False
+    return ws.osascript(f"tell {ws.GHOSTTY}\nset t to first terminal whose id is {ws.q(split)}\n"
+                        f"input text {ws.q(text)} to t\nsend key \"enter\" to t\nend tell") is not None
+
+
+def claude_ancestor():
+    """(pid, tty) of the Claude Code process this command runs under, if any."""
+    pid = os.getppid()
+    while pid > 1:
+        out = subprocess.run(["ps", "-o", "ppid=,tty=,comm=", "-p", str(pid)], capture_output=True, text=True).stdout.split(None, 2)
+        if len(out) < 3:
+            return None
+        if os.path.basename(out[2].strip()) == "claude":
+            return pid, out[1]
+        pid = int(out[0])
+    return None
+
+
+def wait_gone(pid, seconds=15):
+    for _ in range(seconds * 5):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.2)
+    os.kill(pid, signal.SIGKILL)
+    return False
+
+
+def detach(*args):
+    """Run `pool args` in its own session, so it outlives the Claude process it's about to stop."""
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), *args], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=open(STATE / "tab.log", "a"))
+
+
+def flush_session_files(cwd):
+    flush(HOME + "/.claude/projects")
+    if covering(cwd, [SYNC_ROOT]):
+        flush(cwd)
+
+
+def tab(own_session):
+    """`pool tab`: run what this Ghostty tab holds on the other Mac, in the same window; again to bring it back."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    in_tmux = subprocess.run(["tmux", "display", "-p", "#S"], capture_output=True, text=True).stdout.strip() \
+        if os.environ.get("TMUX") else ""
+    found = claude_ancestor()
+    if found:
+        # The session is the Claude process this runs under: its pid and terminal come from the process tree, its
+        # id from the environment, so it works whichever profile started it and however long ago.
+        pid, tty = found
+        sid = own_session or next((s["id"] for s in live_interactive() if s["pid"] == pid), None)
+        if not sid:
+            die("can't tell which Claude session this is")
+        cwd = session_cwd(sid) or os.getcwd()
+        if in_tmux.startswith("pool-") and not in_tmux.startswith("pool-sh-"):
+            # Running here for another Mac's window: find that window's pane before this session ends.
+            status, out = peer(f"p=$(pgrep -f 'new -A -s {in_tmux} ' | head -1); [ -n \"$p\" ] && ps -o tty= -p $p")
+            if status != 0 or not out.strip():
+                die(f"can't find the window on {NAMES[PEER]} showing this session")
+            print(f"pool: bringing this session back to {NAMES[PEER]} in the same window…")
+            detach("_tab-back", str(pid), out.strip(), sid, cwd)
+            return
+        if tty in ("??", "-") or not os.environ.get("TERM_PROGRAM", "ghostty").startswith("ghostty"):
+            die("this Claude session isn't in a terminal tab (`pool tab` moves Ghostty tabs)")
+        if not covering(cwd, [SYNC_ROOT]):
+            note(f"{cwd} isn't shared between the Macs (only ~/code, the vault and Claude history are), "
+                 f"so files this session touches outside ~/code will be {NAMES[PEER]}'s copies")
+        print(f"pool: moving this session to {NAMES[PEER]}; this window stays and reconnects in a few seconds…")
+        # A few seconds' grace, so a turn that ran this (/change-computer) can finish its reply first.
+        detach("_tab-there", str(pid), tty, sid, cwd, "4")
+        return
+    # A plain shell: open a shell on the other Mac in the same folder, in this window. `exit` comes back.
+    if in_tmux.startswith("pool-"):
+        die("this is already a shell on the other Mac; type `exit` to come back")
+    cwd = os.getcwd()
+    status, _ = peer(f"test -d {q(cwd)}")
+    there = cwd if status == 0 else HOME
+    name = "pool-sh-" + re.sub(r"[^A-Za-z0-9]", "-", Path(there).name or "home")
+    if not desktop_tmux_on_peer():
+        die(f"couldn't start tmux from {NAMES[PEER]}'s desktop")
+    print(f"pool: shell on {NAMES[PEER]} in {there} (inside tmux {name}); `exit` comes back here")
+    sys.exit(attach_there(name, f"cd {q(there)} && exec {POOL_TMUX} new -A -s {name}"))
+
+
+def live_interactive():
+    """Interactive Claude sessions on this Mac that have a terminal, from `claude agents` for both profiles:
+    [{pid, tty, started, id, cwd, name, status}] (the shape ghostty-workspace's place() takes)."""
+    rows = []
+    for profile in ("claude", "claude-personal"):
+        out = subprocess.run(["bash", "-c", PREAMBLE + f"command -v {profile} >/dev/null && {profile} agents --json "
+                              "2>/dev/null || echo '[]'"], capture_output=True, text=True).stdout
+        try:
+            rows += json.loads(out or "[]")
+        except ValueError:
+            pass
+    found = {}
+    for a in rows:
+        if a.get("kind") != "interactive" or not a.get("pid") or not a.get("sessionId"):
+            continue
+        pid = int(a["pid"])
+        tty = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        if tty and tty not in ("??", "-"):
+            found[pid] = {"pid": pid, "tty": tty, "started": int(a.get("startedAt") or 0), "id": a["sessionId"],
+                          "cwd": a.get("cwd") or HOME, "name": a.get("name") or "", "status": a.get("status")}
+    return list(found.values())
+
+
+def session_cwd(sid):
+    """The folder session sid works in, as its transcript records it (what `claude --resume` needs)."""
+    for path in Path(HOME, ".claude/projects").glob(f"*/{sid}.jsonl"):
+        with open(path, errors="replace") as f:
+            for line in f:
+                m = re.search(r'"cwd":("(?:[^"\\]|\\.)*")', line)
+                if m:
+                    return json.loads(m.group(1))
+    return None
+
+
+def attach_there(name, command):
+    """Show tmux session `name` on the other Mac in this terminal, reconnecting whenever the connection drops while
+    the session is still running there: over the cable, the office network or Tailscale, whichever answers. While
+    the other Mac is out of reach (you took the M5 away), the session keeps running there and this window keeps
+    trying. Its own connection, not a shared one, so one hiccup can't drop every window. Returns once the session
+    has ended (Ctrl+C stops waiting)."""
+    ssh = ["ssh", "-t", "-o", "ControlMaster=no", "-o", "ControlPath=none", ALIAS[PEER]]
+    has = PREAMBLE + f"{POOL_TMUX} has-session -t {name} 2>/dev/null"
+    while True:
+        status = subprocess.run(ssh + [PREAMBLE + command]).returncode
+        wait = 1
+        while True:
+            alive = peer(has, timeout=10)[0]
+            if alive in (0, 1):  # 0: still running there, 1: ended (anything else: the other Mac is out of reach)
+                break
+            print(f"\r\npool: can't reach {NAMES[PEER]} (the session keeps running there); retrying in {wait}s, "
+                  "Ctrl+C to stop waiting…", flush=True)
+            time.sleep(wait)
+            wait = min(wait * 2, 60)
+        if alive == 1:
+            return status
+        print(f"\r\npool: reconnecting to {NAMES[PEER]}…", flush=True)
+        time.sleep(1)
+
+
+# pool's own tmux server on each Mac, started from that Mac's login session rather than over ssh: processes
+# started over ssh can't read the login keychain, so Claude there says "Not logged in", while sessions an ssh
+# client creates inside a login-session server can (tested 2026-10-27). On the M5 the pool daemon starts it
+# (session pool-home); on the old Mac the launchd agent pool.tmux runs `tmux -L pool -D`
+# (~/.local/share/pool-setup/old-mac-setup.sh). Ghostty can't do it there: with its screen asleep, new windows
+# get no shell.
+POOL_TMUX = "tmux -L pool"
+HAS_DESKTOP_TMUX = f"{POOL_TMUX} has-session -t pool-home 2>/dev/null || pgrep -qf '^/opt/homebrew/bin/tmux -L pool -D'"
+
+
+def desktop_tmux_here():
+    """For the daemon, which launchd runs in the desktop session: start pool's tmux server if it isn't up."""
+    subprocess.run(["bash", "-c", PREAMBLE + f"{HAS_DESKTOP_TMUX} || {POOL_TMUX} new -d -s pool-home"],
+                   capture_output=True)
+
+
+def desktop_tmux_on_peer():
+    """Whether the other Mac's tmux server for pool runs in its login session (never start one over ssh)."""
+    if peer(HAS_DESKTOP_TMUX)[0] == 0:
+        return True
+    note(f"{NAMES[PEER]} has no tmux server for pool running from its login session"
+         + (": run ~/.local/share/pool-setup/old-mac-setup.sh once" if PEER == OLD else ": is the pool daemon running?"))
+    return False
+
+
+def focus_ghostty():
+    """Bring Ghostty to the front, so a move the user asked for is visible (the pane that moves is in a Ghostty window
+    on this Mac). Ghostty's AppleScript can't pick a background tab, but activating shows the window and, in a split
+    layout, the moving pane is already on screen. Best-effort and silent."""
+    subprocess.run(["osascript", "-e", 'tell application id "com.mitchellh.ghostty" to activate'], capture_output=True, timeout=5)
+
+
+def flash_pane(tty, dst_name):
+    """Print a bright bar in the pane so the moving section is easy to spot, and ring the bell (Ghostty marks that tab
+    in the tab bar, which points to it even when it's a background tab). Runs at a shell prompt, after Claude has
+    exited and before the reconnect."""
+    bar = r'\033[1;30;103m    >>>  THIS SESSION IS MOVING TO %s  <<<    \033[0m' % dst_name.upper()
+    type_into(tty, "clear; printf '\\n%s\\n%s\\n%s\\n\\a\\n'" % (bar, bar, bar))
+
+
+def tab_there(pid, tty, sid, cwd, delay=0, show=False):
+    """Detached: stop the session here, then make its pane connect to the other Mac and resume it there. With show (a
+    move the user clicked), bring Ghostty forward and flash the pane so they can see which one is moving."""
+    time.sleep(delay)
+    if show:
+        focus_ghostty()
+    os.kill(pid, signal.SIGTERM)
+    wait_gone(pid)
+    flush_session_files(cwd)
+    if show:
+        flash_pane(tty, "the M1" if PEER == OLD else "the M5")
+        time.sleep(1.0)   # let the bar sit a moment before the reconnect scrolls it up
+    line = f"pool _remote-claude {sid} {q(cwd)}"
+    for _ in range(3):  # typed keystrokes occasionally don't land; check the command started, else type it again
+        if type_into(tty, line) and started_on(tty, f"_remote-claude {sid}"):
+            log(f"tab: session {sid[:8]} now runs on {NAMES[PEER]}, shown in its window on {NAMES[SELF]}")
+            return
+    log(f"tab move of {sid[:8]}: couldn't start the reconnect in its pane ({tty})")
+    notify(f"Couldn't reconnect the tab for session {sid[:8]}; type `{line}` in it.")
+
+
+def started_on(tty, needle, seconds=6):
+    """Whether a process whose command line contains needle shows up on tty within a few seconds."""
+    for _ in range(seconds * 2):
+        out = subprocess.run(["ps", "-t", tty, "-o", "args="], capture_output=True, text=True).stdout
+        if needle in out:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def remote_claude(sid, cwd):
+    """In a pane: resume sid on the other Mac inside tmux pool-<id>, so a dropped connection doesn't end it."""
+    status, _ = peer(f"test -d {q(cwd)}")
+    there = cwd if status == 0 else HOME
+    inner = PREAMBLE + f"cd {q(there)} && exec claude --resume {sid} {RESUME_SETTINGS}"
+    if not desktop_tmux_on_peer():
+        die(f"couldn't start tmux from {NAMES[PEER]}'s desktop, and a session started over ssh there can't sign in")
+    print(f"pool: session {sid[:8]} runs on {NAMES[PEER]} (tmux pool-{sid[:8]}). "
+          "To bring it back here, type /change-computer in it.")
+    # Only the M5 takes a session over when the other side goes quiet: it's the Mac that leaves with you, and the
+    # old Mac losing the M5 means the session is still alive on the M5.
+    sys.exit(attach_there(f"pool-{sid[:8]}", f"exec {POOL_TMUX} new -A -s pool-{sid[:8]} -c {q(there)} {q(inner)}"))
+
+
+def remote_windows_here():
+    """[(tty, sid, cwd)] for the windows on this Mac showing a Claude session that runs on the other Mac."""
+    out = subprocess.run(["ps", "-Ao", "tty=,args="], capture_output=True, text=True).stdout
+    rows = []
+    for line in out.splitlines():
+        m = re.match(r"(\S+)\s+.*\bpool _remote-claude ([0-9a-f-]{36}) (.+)$", line)
+        if m and m.group(1) not in ("??", "-"):
+            rows.append((m.group(1), m.group(2), m.group(3)))
+    return rows
+
+
+def windowless_here():
+    """Pool tmux sessions running on this Mac that no terminal on this Mac shows (only the other Mac, or none)."""
+    names = subprocess.run(["bash", "-c", PREAMBLE + f"{POOL_TMUX} ls -F '#{{session_name}}' 2>/dev/null"],
+                           capture_output=True, text=True).stdout.split()
+    clients = subprocess.run(["bash", "-c", PREAMBLE + f"{POOL_TMUX} list-clients -F '#{{client_pid}} #{{session_name}}' 2>/dev/null"],
+                             capture_output=True, text=True).stdout.splitlines()
+    local = set()
+    for line in clients:
+        pid, _, name = line.partition(" ")
+        if not over_ssh(int(pid)):
+            local.add(name)
+    return [n for n in names if n.startswith("pool-") and n != "pool-home" and n not in local]
+
+
+def over_ssh(pid):
+    while pid > 1:
+        out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True).stdout.split(None, 1)
+        if len(out) < 2:
+            return False
+        if "sshd" in out[1]:
+            return True
+        pid = int(out[0])
+    return False
+
+
+def open_windows_here(names):
+    """One new Ghostty window on this Mac with a tab attached to each of these pool tmux sessions."""
+    if not names:
+        return
+    ws = workspace()
+    cfg = lambda n: "{initial input:%s & linefeed}" % ws.q(f"{POOL_TMUX} attach -t {n}")
+    lines = [f"tell {ws.GHOSTTY}", f"set w to new window with configuration {cfg(names[0])}"]
+    lines += [f"new tab in w with configuration {cfg(n)}" for n in names[1:]]
+    ws.osascript("\n".join(lines + ["end tell"]))
+
+
+def go_home(reason):
+    """On the M5 when away from the old Mac: sessions running here that only the old Mac's windows show get windows
+    here. Nothing running on the old Mac is touched: it stays home running service and its sessions, and the M5's
+    windows for those reconnect when it's reachable (Tailscale)."""
+    if SELF != M5:
+        die("`pool home` opens windows on the M5; run it there")
+    shown = windowless_here()
+    open_windows_here(shown)
+    msg = f"{reason}: " + (f"opened {len(shown)} session(s) that run on the M5 but were only shown on the old Mac"
+                           if shown else "every session running on the M5 already has a window here")
+    log(msg)
+    if shown:
+        notify(msg + ".")
+    return msg
+
+
+def tab_back(pid, peer_tty, sid, cwd):
+    """Detached, on the Mac running a session for the other Mac's window: stop it here and resume it there."""
+    os.kill(pid, signal.SIGTERM)
+    wait_gone(pid)
+    flush_session_files(cwd)
+    time.sleep(3)  # the window's ssh exits once tmux does and pool sees the session is gone; let its shell get back to a prompt
+    status, _ = peer(f"pool _type {q(peer_tty)} {q(f'cd {q(cwd)} && claude --resume {sid} {RESUME_SETTINGS}')}")
+    log(f"tab: session {sid[:8]} back on {NAMES[PEER]}" + ("" if status == 0 else " (couldn't type into its pane)"))
+
+
+def tab_candidates():
+    """On this Mac: the Claude sessions open in Ghostty panes, with what deciding to move one needs."""
+    ws = workspace()
+    terms = ws.terminals() or []
+    sessions = live_interactive()
+    ws.place(sessions, terms)
+    by_id = {t["id"]: t for t in terms}
+    rows = []
+    for s in sessions:
+        t = by_id.get(s.get("terminal"))
+        if not t:
+            continue  # not in a Ghostty pane here (e.g. a moved session running in tmux for the other Mac)
+        transcript = ws.find_transcript(s["id"])
+        rows.append({"sid": s["id"], "pid": s["pid"], "tty": s["tty"], "cwd": s["cwd"], "name": s["name"],
+                     "status": s["status"],
+                     # the pane that gets your keystrokes: focused, in the selected tab of the front window
+                     "in_use": t["w"] == 1 and t["selected"] and t["focused"],
+                     "idle_for": time.time() - os.stat(transcript).st_mtime if transcript else 0})
+    return rows
+
+
+def pool_tmux_panes():
+    """{pid of the process in each pane: tmux session name} for pool's tmux server on this Mac."""
+    out = subprocess.run(["bash", "-c", PREAMBLE + f"{POOL_TMUX} list-panes -a -F '#{{pane_pid}} #{{session_name}}' 2>/dev/null"],
+                         capture_output=True, text=True).stdout
+    return {int(p): n for p, _, n in (l.partition(" ") for l in out.splitlines()) if p.isdigit()}
+
+
+def in_ghostty(pid):
+    """Whether process pid runs in a Ghostty pane on this Mac, not inside tmux or an ssh login."""
+    while pid > 1:
+        out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True).stdout.split(None, 1)
+        if len(out) < 2:
+            return False
+        comm = os.path.basename(out[1].strip())
+        if comm == "ghostty":
+            return True
+        if comm == "tmux" or "sshd" in comm:
+            return False
+        pid = int(out[0])
+    return False
+
+
+def tab_move(sid, delay=0, show=False):
+    """On this Mac: move the Claude session sid's Ghostty tab to run on the other Mac, its window staying put. A
+    session running here for the other Mac's window goes back there (what /change-computer inside it does). False if
+    it's neither, rather than stopping a session no pane could reconnect to. show (a move the user clicked) brings
+    Ghostty forward so the reconnect is visible."""
+    live = [s for s in live_interactive() if s["id"].startswith(sid)]
+    if len(live) != 1:
+        return False
+    s = live[0]
+    name = pool_tmux_panes().get(s["pid"], "")
+    if name.startswith("pool-") and not name.startswith(("pool-sh-", "pool-home")):
+        status, out = peer(f"p=$(pgrep -f 'new -A -s {name} ' | head -1); [ -n \"$p\" ] && ps -o tty= -p $p")
+        if status != 0 or not out.strip():
+            return False
+        detach("_tab-back", str(s["pid"]), out.strip(), s["id"], session_cwd(s["id"]) or s["cwd"])
+        return True
+    if not in_ghostty(s["pid"]):
+        return False
+    detach("_tab-there", str(s["pid"]), s["tty"], s["id"], s["cwd"], str(delay), "1" if show else "0")
+    return True
+
+
+def auto_tab(src, dst, pins, dry_run=False):
+    """Move one Claude tab's work off an overloaded Mac (its window stays put): one that's idle between turns, has
+    had no activity for 5 minutes, isn't the pane you're typing in and whose tier lets it run on dst (home tabs never
+    go to the M1, m1 tabs never to the M5). Tabs that belong on dst go first. Return its session id, or None."""
+    rows = tab_candidates() if src == SELF else json.loads(peer("pool _tab-candidates", timeout=60)[1] or "[]")
+    paths = [p for p in pins if p.startswith("/")]
+    chosen = chosen_tiers()
+    tier = {r["sid"]: tier_of(r["sid"], r["name"], r["cwd"], "interactive", r["idle_for"], pins, chosen)[0] for r in rows}
+    ok = [r for r in rows if r["status"] == "idle" and not r["in_use"] and r["idle_for"] >= 300
+          and r["sid"][:8] not in pins and not covering(r["cwd"], paths) and not recently_moved(r["sid"])
+          and allowed_on(tier[r["sid"]], dst)]
+    if not ok:
+        return None
+    r = max(ok, key=lambda r: (TIER_HOST.get(tier[r["sid"]]) == dst, r["idle_for"]))
+    what = f"{r['sid'][:8]} ({r['name'] or r['cwd']})"
+    if dry_run:
+        print(f"would run the Claude tab {what} on {NAMES[dst]}, its window staying on {NAMES[src]}")
+        return None
+    if not (tab_move(r["sid"]) if src == SELF else peer(f"pool _tab-move {r['sid']}")[0] == 0):
+        log(f"auto tab move of {what} failed")
+        return None
+    record_move(r["sid"])
+    notify(f"{NAMES[src].capitalize()} is overloaded, so the Claude tab {what} now runs on {NAMES[dst]}. "
+           f"Its window stays where it is; type /change-computer in it to bring it back.")
+    return r["sid"]
+
+
+# --- the link: the Thunderbolt cable when it's plugged in, Wi-Fi otherwise ---
+# peer-route (the ssh ProxyCommand) tries the cable first for every new connection, and ssh's keepalives drop a
+# connection about 15 s after the cable is pulled, so it comes back over Wi-Fi by itself. What nothing did was move a
+# connection made while the cable was out back onto it once it returns: on 2026-10-28 all of Mutagen's syncs ran over
+# Wi-Fi (2 MB/s, ~400 ms) for three hours with the cable (145 MB/s, 0.5 ms) plugged in.
+
+REROUTE_STATE = STATE / "reroute.json"
+
+
+SIOCGIFMEDIA = 0xC02C6938  # _IOWR('i', 56, struct ifmediareq) in the 44-byte layout this macOS answers
+_members = {"at": 0.0, "names": []}
+
+
+def bridge_members():
+    """The Thunderbolt ports in the bridge (en1, en2, ...), re-read every minute."""
+    if time.time() - _members["at"] > 60:
+        out = subprocess.run(["ifconfig", "bridge0"], capture_output=True, text=True).stdout
+        _members.update(at=time.time(), names=re.findall(r"member: (\w+)", out))
+    return _members["names"]
+
+
+def has_link(ifname, sock=None):
+    """Whether ifname has a link (a cable in and negotiated), asked of the driver directly: one system call."""
+    import fcntl, socket, struct
+    own = sock is None
+    sock = sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        res = fcntl.ioctl(sock.fileno(), SIOCGIFMEDIA, struct.pack("16s7i", ifname.encode(), 0, 0, 0, 0, 0, 0, 0))
+        status = struct.unpack("16s7i", res)[3]
+        return bool(status & 1 and status & 2)  # IFM_AVALID and IFM_ACTIVE
+    except OSError:
+        return False
+    finally:
+        if own:
+            sock.close()
+
+
+def cable_plugged(sock=None):
+    """Whether a Thunderbolt cable to the other Mac is plugged in: any port in the bridge has a link."""
+    return any(has_link(m, sock) for m in bridge_members())
+
+
+def cable_peer():
+    """The other Mac's address on the cable when the cable is plugged in and the other Mac answers on it (the
+    address peer-route tries first, else one ARP has learned on the bridge), or None."""
+    if not cable_plugged():
+        return None
+    answers = lambda ip: subprocess.run(["nc", "-z", "-G", "1", ip, "22"], capture_output=True).returncode == 0
+    for f in Path(HOME, ".cache").glob("peer-route-*"):
+        ip = f.read_text().strip()
+        if ip.startswith("169.254.") and answers(ip):
+            return ip
+    subprocess.run(["ping", "-c", "1", "-t", "1", "169.254.255.255"], capture_output=True)
+    arp = subprocess.run(["arp", "-an", "-i", "bridge0"], capture_output=True, text=True).stdout
+    return next((ip for ip in re.findall(r"\((169\.254\.[0-9.]+)\)", arp) if answers(ip)), None)
+
+
+def peer_links(ps_out=None):
+    """This Mac's ssh connections to the other Mac, from the `nc <address> 22` each runs as its ProxyCommand:
+    [{"kind", "ssh" (pid), "ip", "route"}]. kind is mutagen, window (a pool window showing a session the other Mac
+    runs), stream (pool top's samples), master (the shared ControlMaster connection) or other (yours: left alone)."""
+    out = ps_out if ps_out is not None else subprocess.run(["ps", "-axo", "pid=,ppid=,args="], capture_output=True, text=True).stdout
+    procs = {}
+    for line in out.splitlines():
+        f = line.split(None, 2)
+        if len(f) == 3 and f[0].isdigit():
+            procs[int(f[0])] = (int(f[1]), f[2])
+    links = []
+    for pid, (ppid, args) in procs.items():
+        m = re.match(r"nc (-X 5 -x \S+ )?(\d+\.\d+\.\d+\.\d+) 22$", args)
+        if not m:
+            continue
+        ip, parent = m.group(2), procs.get(ppid, (0, ""))[1]
+        kind = ("mutagen" if ".mutagen/agents" in parent else "window" if "tmux -L pool new -A -s pool-" in parent
+                else "stream" if "pool-top --stream" in parent else "master" if ppid == 1 or "[mux]" in parent else "other")
+        route = "cable" if ip.startswith("169.254.") else "Tailscale" if m.group(1) or ip.startswith("100.") else "Wi-Fi"
+        links.append({"kind": kind, "ssh": ppid, "ip": ip, "route": route})
+    # A sync with no nc of its own rides a shared ControlMaster connection (the M5's ~/.ssh/config now gives Mutagen
+    # its own; ones made before that, or after a config change, still ride). Which shared connection isn't visible,
+    # so while any is off the cable, count the sync off it too, and the next move gives it a connection of its own.
+    masters = [l for l in links if l["kind"] == "master"]
+    off = next((m for m in masters if m["route"] != "cable"), None)
+    master = off or (masters[0] if masters else None)
+    own = {l["ssh"] for l in links}
+    for pid, (_, args) in procs.items():
+        if ".mutagen/agents" in args and re.match(r"(/usr/bin/)?ssh ", args) and pid not in own:
+            links.append({"kind": "mutagen", "ssh": pid, "ip": master["ip"] if master else "",
+                          "route": master["route"] if master else "shared", "shared": True})
+    return links
+
+
+def reroute(dry_run=False, links=None, cable=None, plugged=None, now=None, force=False):
+    """Put this Mac's connections to the other Mac on the right route: onto the cable when it's plugged in and the
+    other Mac answers there, back to Wi-Fi straight away when it's pulled (connections on a pulled cable are dead, and
+    ssh's keepalives would take ~15 s to notice). Mutagen's syncs reconnect with a pause and resume (on the M5, where
+    its daemon runs); pool's windows and streams drop their ssh and reconnect by themselves (a window blanks for a
+    second; the session in it keeps running); the shared ssh connection is retired (a dead one ended). Your own ssh
+    sessions are left alone. Returns what it did (or would do)."""
+    links = peer_links() if links is None else links
+    plugged = cable_plugged() if plugged is None else plugged
+    every = links
+    if plugged:
+        if not (cable_peer() if cable is None else cable):
+            return []  # plugged in, the other Mac not answering on it yet
+        target, links = "cable", [l for l in links if l["route"] != "cable"]
+    else:
+        target, links = "Wi-Fi", [l for l in links if l["route"] == "cable"]
+    if not links:
+        return []
+    now = now or time.time()
+    try:
+        last = json.loads(REROUTE_STATE.read_text())
+    except (OSError, ValueError):
+        last = {}
+    # Off a pulled cable at once (those connections are dead); onto a plugged one at most every 2 minutes per kind, so
+    # a loose plug can't keep bouncing the syncs. force: `pool route --fix`, asked for now.
+    wait = 15 if target == "Wi-Fi" else 120
+    due = lambda key: force or now - last.get(f"{key}>{target}", 0) >= wait
+    mark = lambda key: last.__setitem__(f"{key}>{target}", now)
+    done = []
+    kinds = {l["kind"] for l in links}
+    # The shared connection first: once it's retired, reconnects below open a new one on the right route. Not when
+    # one is already on that route: the other is a retired one finishing its last sessions.
+    if "master" in kinds and due("master") and not any(l["kind"] == "master" and l["route"] == target for l in every):
+        done.append("the shared ssh connection " + ("hands over to a new one on the cable" if target == "cable"
+                                                    else "on the pulled cable is closed"))
+        if not dry_run:
+            subprocess.run(["ssh", "-O", "stop" if target == "cable" else "exit", ALIAS[PEER]], capture_output=True, timeout=10)
+            mark("master")
+    # Mutagen's syncs, pool's windows and streams: drop the connection and each comes back by itself over peer-route,
+    # so on the right route (Mutagen reconnects in under a second; a sync never gets left paused, as a pause and resume
+    # interrupted half way did on 2026-10-28). Mutagen's ssh runs on the M5, where its daemon is.
+    for l in links:
+        key = f"{l['kind']}:{l['ssh']}"
+        movable = l["kind"] in ("window", "stream") or (l["kind"] == "mutagen" and SELF == M5)
+        if movable and due(key):
+            done.append(f"{'Mutagen sync' if l['kind'] == 'mutagen' else 'pool ' + l['kind']} (ssh {l['ssh']}) reconnects over the {target}")
+            if not dry_run:
+                try:
+                    os.kill(l["ssh"], signal.SIGTERM)
+                except OSError:
+                    pass
+                mark(key)
+    if done and not dry_run:
+        STATE.mkdir(parents=True, exist_ok=True)
+        REROUTE_STATE.write_text(json.dumps({k: v for k, v in last.items() if now - v < 3600}))
+        log("link: " + "; ".join(done))
+    return done
+
+
+def doctor():
+    """`pool doctor`: is the two-Mac setup healthy? Config, ssh to the other Mac, the cable, file sync, the services."""
+    ok = [True]
+
+    def check(name, good, detail=""):
+        ok[0] = ok[0] and good
+        print(f"  [{'ok  ' if good else 'FAIL'}] {name}" + (f" - {detail}" if detail else ""))
+
+    print(f"pool doctor - this Mac is {NAMES.get(SELF, SELF)} ({SELF})\n")
+    known = SELF in (M5, OLD)
+    check("this Mac is one of the two in the config", known,
+          SELF if known else f"{SELF} is neither {M5!r} nor {OLD!r}; run `pool setup`")
+    reachable = peer("echo ok")[1].strip() == "ok"
+    check(f"ssh to {NAMES[PEER]} (alias {ALIAS[PEER]})", reachable,
+          "" if reachable else f"can't reach it; check `ssh {ALIAS[PEER]}` and ~/.ssh/config")
+    if reachable:
+        same = peer("python3 -c 'import importlib.machinery,os;"
+                    "p=importlib.machinery.SourceFileLoader(\"p\",os.path.expanduser(\"~/.local/bin/pool\")).load_module();"
+                    "print(p.M5,p.OLD)'")[1].strip()
+        check("the other Mac runs pool with the same two hosts", same == f"{M5} {OLD}", same)
+    plugged = cable_plugged()
+    print(f"  [--  ] Thunderbolt cable: {'plugged in' if plugged else 'not plugged in (Wi-Fi is used, which is fine)'}")
+    sessions = sync_sessions()
+    if sessions:
+        bad = [s["name"] for s in sessions if not healthy(s)]
+        check(f"file sync ({len(sessions)} folders)", not bad, "all in step" if not bad else "needs a look: " + ", ".join(bad))
+    else:
+        print("  [--  ] file sync: Mutagen not set up (sessions can't move without it; see SETUP.md)")
+    if SELF == M5:
+        import os as _os
+        plist = _os.path.expanduser("~/Library/LaunchAgents/pool.daemon.plist")
+        running = "pool.daemon" in subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
+        check("pool daemon (launchd on the travel Mac)", running, "running" if running else "not loaded; see SETUP.md")
+    if SERVICE_LABEL:
+        up = (f'"{SERVICE_LABEL}"' in subprocess.run(["bash", "-c", f"launchctl list | grep {q(SERVICE_LABEL)} || "
+              f"ssh {ALIAS[OLD] if SELF == M5 else ''} launchctl list | grep {q(SERVICE_LABEL)}"], capture_output=True, text=True).stdout
+              or service_sessions() != set())
+        print(f"  [--  ] always-on service ({(CONF['always_on'] or {}).get('name')}): {'running' if up else 'not detected'}")
+    print("\nAll good." if ok[0] else "\nSome checks failed - see SETUP.md.")
+    print("\nConnections right now:")
+    route_status()
+    sys.exit(0 if ok[0] else 1)
+
+
+def route_status():
+    """`pool route`: whether the cable is up, and the route of every connection between the Macs, from both sides."""
+    for host, links, cable in ((SELF, peer_links(), cable_peer()),
+                               (PEER, json.loads(peer("pool _links", timeout=20)[1] or "[]"), None)):
+        if host == SELF:
+            print("cable: " + (f"plugged in, {NAMES[PEER]} answers at {cable}" if cable else
+                               f"plugged in, {NAMES[PEER]} not answering on it yet" if cable_plugged() else
+                               "not plugged in (Wi-Fi is used)"))
+        print(f"{NAMES[host]}'s connections to {NAMES[OTHER_OF[host]]}:")
+        for l in sorted(links, key=lambda l: (l["kind"], l["route"])):
+            print(f"  {l['kind']:8} {l['route']:9} {l['ip']:16} ssh {l['ssh']}"
+                  + ("  (through the shared connection)" if l.get("shared") else ""))
+        if not links:
+            print("  none")
+
+
+OTHER_OF = {M5: OLD, OLD: M5}
+
+
+# --- service, which runs on the old Mac around the clock ---
+
+def on_old(script, timeout=60):
+    """Run script on the old Mac (here, or over ssh from the M5). Return (status, output)."""
+    if SELF == OLD:
+        p = subprocess.run(["bash", "-c", PREAMBLE + script], capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout + p.stderr
+    return peer(script + " 2>&1", timeout=timeout)
+
+
+def service(args):
+    """`pool service [logs|restart]`. The always-on service's launchd agent lives in the stay Mac's login session
+    (gui domain), where sessions it starts can read the keychain, so a restart never goes through an ssh session.
+    Configure it with "always_on": {"label": ..., "state": ..., "name": ..., "log": ...} in pool.json."""
+    if not SERVICE_LABEL:
+        die('no always-on service is configured (set "always_on" in ~/.config/pool/pool.json)')
+    what = args[0] if args else "status"
+    svc = f"gui/$(id -u)/{SERVICE_LABEL}"
+    log_file = (CONF["always_on"] or {}).get("log")
+    if what == "status":
+        tail = (f"echo 'recent log:'; tail -n 5 {q(log_file)} | cut -c1-160 | sed 's/^/  /'") if log_file else "true"
+        status, out = on_old(
+            f"pid=$(launchctl print {svc} 2>/dev/null | awk '/^\tpid = / {{print $3}}'); "
+            f"state=$(launchctl print {svc} 2>/dev/null | awk '/^\tstate = / {{print $3; exit}}'); "
+            "echo \"service: ${state:-not loaded}${pid:+ (pid $pid, up $(ps -o etime= -p $pid | tr -d ' '))}\"; " + tail)
+        print(out.rstrip() if out else f"pool: can't reach {NAMES[OLD]}")
+        return status
+    if what == "logs":
+        if not log_file:
+            die('no log path configured (add "log" to "always_on" in pool.json)')
+        if "-f" in args:
+            return subprocess.run(["ssh", "-t", ALIAS[OLD], f"tail -n 40 -f {q(log_file)}"] if SELF != OLD
+                                  else ["bash", "-c", f"tail -n 40 -f {q(log_file)}"]).returncode
+        status, out = on_old(f"tail -n 40 {q(log_file)}")
+        print(out.rstrip())
+        return status
+    if what == "restart":
+        status, out = on_old(f"launchctl kickstart -k {svc} && sleep 3 && "
+                             f"launchctl print {svc} | awk '/^\tstate = / {{print \"service: \" $3; exit}}'")
+        print(out.rstrip())
+        return status
+    die(f"unknown service command {what!r}; try `pool service`, `pool service logs [-f]`, or `pool service restart`")
+
+
+# --- sync conflicts ---
+
+def index_checkout(path):
+    """The checkout a git index file belongs to, or None if path isn't one."""
+    repo, sep, inner = path.partition("/.git/")
+    if not sep:
+        return None
+    if inner == "index":
+        return repo
+    m = re.fullmatch(r"worktrees/([^/]+)/index", inner)
+    if not m:
+        return None
+    try:
+        return os.path.dirname(Path(repo, ".git/worktrees", m.group(1), "gitdir").read_text().strip())
+    except OSError:
+        return None
+
+
+def working_in(checkout, per_mac):
+    """The one Mac with a Claude session working in checkout (not a worktree nested under it), else None."""
+    hosts = set()
+    for host, ss in per_mac.items():
+        for _, s in ss:
+            cwd = s.get("cwd") or ""
+            if cwd == checkout or (cwd.startswith(checkout + "/") and not cwd.startswith(checkout + "/.claude/worktrees/")):
+                hosts.add(host)
+    return hosts.pop() if len(hosts) == 1 else None
+
+
+def read_on(host, path):
+    if host == SELF:
+        return Path(path).read_bytes()
+    return subprocess.run(["ssh", ALIAS[PEER], f"cat {q(path)}"], capture_output=True, check=True, timeout=60).stdout
+
+
+def replace_on(host, path, data):
+    """Atomically replace path's content on host (the temp file sits outside the synced folders)."""
+    tmp = f"{HOME}/.local/state/pool/replace-{os.getpid()}"
+    if host == SELF:
+        Path(tmp).write_bytes(data)
+        os.replace(tmp, path)
+    else:
+        subprocess.run(["ssh", ALIAS[PEER], f"mkdir -p ~/.local/state/pool && cat > {q(tmp)} && mv {q(tmp)} {q(path)}"],
+                       input=data, check=True, timeout=60)
+
+
+def mtime_on(host, path):
+    if host == SELF:
+        return os.stat(path).st_mtime
+    status, out = peer(f"stat -f %m {q(path)}")
+    return float(out.strip()) if status == 0 and out.strip() else 0.0
+
+
+NOTIFIED = set()
+
+
+def settle_conflicts(sessions):
+    """Two-way sync holds a file still when both Macs changed it. Pick a winner, save the loser's copy and give it
+    the winner's content, so the next sync cycle sees them equal. A git index goes to the Mac with a session
+    working in that checkout (each Mac's index carries its own file timestamps, so they clash whenever both run
+    git there); anything else goes to the newer copy."""
+    per_mac = None
+    for s in sessions:
+        for c in s.get("conflicts") or []:
+            path = os.path.join(s["beta"]["path"], c.get("root", ""))
+            kinds = {(ch.get("new") or {}).get("kind") for ch in c.get("alphaChanges", []) + c.get("betaChanges", [])}
+            if kinds != {"file"}:
+                if path not in NOTIFIED:
+                    NOTIFIED.add(path)
+                    notify(f"Sync conflict at {os.path.relpath(path, HOME)} needs a look "
+                           f"(`mutagen sync list --long {s['name']}`).")
+                continue
+            checkout = index_checkout(path)
+            winner = None
+            if checkout:
+                per_mac = per_mac or all_sessions()
+                winner = working_in(checkout, per_mac)
+            if not winner:
+                winner = SELF if mtime_on(SELF, path) >= mtime_on(PEER, path) else PEER
+            loser = PEER if winner == SELF else SELF
+            keep = STATE / "conflicts" / time.strftime("%Y%m%d-%H%M%S") / ("m5" if loser == M5 else "old")
+            dest = keep / os.path.relpath(path, HOME)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                dest.write_bytes(read_on(loser, path))
+                replace_on(loser, path, read_on(winner, path))
+            except (OSError, subprocess.SubprocessError) as e:
+                log(f"couldn't settle {path}: {e}")
+                continue
+            msg = (f"Both Macs changed {os.path.relpath(path, HOME)}; kept {NAMES[winner]}'s copy, "
+                   f"saved {NAMES[loser]}'s in {keep}.")
+            log(msg) if checkout else notify(msg)
+
+
+# --- daemon ---
+
+def daemon():
+    STATE.mkdir(parents=True, exist_ok=True)
+    desktop_tmux_here()
+    over = {M5: 0, OLD: 0}
+    last_balance = 0.0
+    away = cable_seen = cycle = 0
+    while True:
+        cycle += 1
+        try:
+            # The cable gets priority: once it has answered on two passes in a row (so a loose plug doesn't bounce
+            # connections), move whatever is still on Wi-Fi onto it; once it's pulled, move what was on it to Wi-Fi.
+            # Here every pass, on the other Mac every minute. (PoolBar's agents react within a second; this is the
+            # backstop when PoolBar isn't running.)
+            plugged = cable_plugged()
+            cable_seen = cable_seen + 1 if plugged and cable_peer() else 0
+            if cable_seen >= 2 or not plugged:
+                reroute(plugged=plugged)
+                if cycle % 4 == 0:
+                    peer("pool _reroute", timeout=60)
+        except Exception as e:
+            log(f"daemon reroute failed: {e!r}")
+        try:
+            # Leaving the office: a minute with the old Mac out of reach opens windows here for what runs here
+            # (windows showing old-Mac sessions take those over by themselves); back in reach, its stale copies
+            # stop. Unplugging the cable isn't a signal: it comes out for display rearranging too.
+            loads = measure_both()
+            if PEER not in loads:
+                away += 1
+                if away == 4:
+                    go_home(f"{NAMES[PEER].capitalize()} out of reach")
+            else:
+                away = 0
+            sessions = sync_sessions()
+            d = {"loads": loads, "synced": synced_roots(sessions)}
+            (STATE / "load.json").write_text(json.dumps(d))
+            peer("mkdir -p ~/.local/state/pool && cat > ~/.local/state/pool/load.json", input=json.dumps(d))
+            settle_conflicts(sessions)
+            for h in over:
+                over[h] = over[h] + 1 if h in loads and overloaded(loads[h]) else 0
+            # Two minutes of overload, at most one rebalancing every five.
+            if max(over.values()) * INTERVAL >= 120 and time.time() - last_balance > 300:
+                last_balance = time.time()
+                balance(loads)
+        except Exception as e:  # keep the loop alive; the log says what broke
+            log(f"daemon cycle failed: {e!r}")
+        time.sleep(INTERVAL)
+
+
+# --- status ---
+
+def recent(n=8):
+    """The last n lines of both Macs' pool logs (moves, commands sent across, conflicts), newest last."""
+    lines = []
+    for host, text in ((SELF, (STATE / "pool.log").read_text() if (STATE / "pool.log").exists() else ""),
+                       (PEER, peer("tail -n 40 ~/.local/state/pool/pool.log 2>/dev/null", timeout=5)[1])):
+        lines += [(l[:19], "M5" if host == M5 else "old", l[20:]) for l in text.splitlines()[-40:] if len(l) > 20]
+    return sorted(lines)[-n:]
+
+
+def bar(m, width=30):
+    """Share of cores busy; past 100% the bar is full and the overflow is printed after it."""
+    frac = busy(m)
+    filled = min(width, round(frac * width))
+    return "█" * filled + "·" * (width - filled) + (f" +{frac - 1:.0%}" if frac > 1 else "")
+
+
+def watch(once=False):
+    per_mac, sessions_at = {}, 0.0
+    try:
+        while True:
+            loads = measure_both()
+            if time.time() - sessions_at > 10:  # listing sessions takes a second or two; refresh it less often
+                per_mac = all_sessions() if SELF == M5 else {SELF: local_sessions()}
+                sessions_at = time.time()
+            out = [f"pool · {time.strftime('%H:%M:%S')} · cores busy (█) on each Mac · Ctrl+C to quit", ""]
+            for h in (M5, OLD):
+                m = loads.get(h)
+                if not m:
+                    out.append(f"{NAMES[h]:12} unreachable")
+                    continue
+                ss = [s for _, s in per_mac.get(h, []) if s.get("pid")]
+                working = sum(1 for s in ss if s.get("status") == "busy")
+                out.append(f"{NAMES[h]:12} {bar(m):36} {busy(m):>5.0%}   load {m['load1']:>5.1f} / {m['cores']:<3}"
+                           f" memory free {m['mem_free']:>3}%   sessions {len(ss)} ({working} working)")
+            sessions = sync_sessions()
+            bad = [s["name"] for s in sessions if not healthy(s)]
+            out += ["", f"sync: {len(sessions)} folders, " + (f"needs a look: {', '.join(bad)}" if bad else "all in step"),
+                    "", "recent (moves, commands sent to the other Mac, sync conflicts):"]
+            out += [f"  {t[11:]} {who:>3}  {msg[:110]}" for t, who, msg in recent()] or ["  nothing yet"]
+            print("\033[H\033[2J" + "\n".join(out) if not once else "\n".join(out), flush=True)
+            if once:
+                return
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print()
+
+
+def status():
+    d = cached_loads() or {"loads": measure_both(), "synced": synced_roots(sync_sessions())}
+    loads = d["loads"]
+    per_mac = all_sessions() if SELF == M5 else {SELF: local_sessions()}
+    print(f"{'':14}{'load':>12}{'busy':>7}{'room':>7}{'mem free':>10}   sessions")
+    for h in (M5, OLD):
+        m = loads.get(h)
+        if not m:
+            print(f"{NAMES[h]:14}  unreachable")
+            continue
+        line = f"{NAMES[h]:14}{m['load1']:>6} / {m['cores']:<3}{busy(m):>7.0%}{room(m):>7.1f}{m['mem_free']:>9}%"
+        if h in per_mac:
+            ss = [s for _, s in per_mac[h] if s.get("pid")]  # entries without a process aren't running
+            bg = sum(1 for s in ss if s.get("kind") == "background")
+            working = sum(1 for s in ss if s.get("status") == "busy")
+            line += f"   {len(ss)} ({working} working, {bg} in background)"
+        print(line)
+    print("room = idle capacity in old-Mac cores (an M5 core is about 1.8 of them)")
+    sessions = sync_sessions()
+    bad = [s for s in sessions if not healthy(s) and "-seed" not in s["name"]]
+    seeding = [s["name"] for s in sessions if "-seed" in s["name"]]
+    print(f"sync: {len(sessions) - len(seeding)} folders live" + (f", {len(bad)} need attention: "
+          + ", ".join(f"{s['name']} ({s.get('status')})" for s in bad) if bad else ", all in step")
+          + (f"; seeding {', '.join(seeding)}" if seeding else ""))
+
+
+def local_sessions():
+    """[(profile, session dict)] on this Mac (used when only this side's view is available)."""
+    return agents_on(SELF)
+
+
+def main():
+    own_session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    for k in [k for k in os.environ if k.startswith("CLAUDE")]:
+        del os.environ[k]
+    args = sys.argv[1:]
+    cmd = args[0] if args else "status"
+    rest = args[1:]
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+    elif cmd == "status":
+        status()
+    elif cmd == "watch":
+        watch(once="--once" in rest)
+    elif cmd == "run":
+        sys.exit(run(rest))
+    elif cmd == "hook":
+        hook()
+    elif cmd == "daemon":
+        daemon()
+    elif cmd == "balance":
+        moved = balance(dry_run="--dry-run" in rest)
+        if not moved and "--dry-run" not in rest:
+            print("nothing to move: neither Mac is overloaded, or no idle background session can go")
+    elif cmd == "move":
+        if not rest:
+            die("which session? `pool` lists them")
+        to = SHORT.get(rest[rest.index("--to") + 1]) if "--to" in rest else None
+        sid = rest[0]
+        if not to:
+            found = {h for h, ss in all_sessions().items() for _, s in ss if (s.get("sessionId") or "").startswith(sid)}
+            if len(found) != 1:
+                die(f"session {sid} isn't running on exactly one Mac; pass --to m5 or --to old")
+            to = OLD if found.pop() == M5 else M5
+        sid, cwd, target = move(sid, to)
+        print(f"Moved {sid[:8]} ({cwd}) to {NAMES[to]}" + (f"; attach with `claude attach {target}` on {NAMES[OLD]}" if to == OLD else
+                                                            f"; attach with `claude attach {target}`"))
+    elif cmd == "doctor":
+        doctor()
+    elif cmd == "route":
+        if "--fix" in rest:
+            for line in reroute(force=True) + [l for l in peer("pool _reroute --force", timeout=90)[1].splitlines() if l]:
+                print("fixed:", line)
+            time.sleep(8)  # let dropped connections come back before showing the routes
+        route_status()
+    elif cmd == "_reroute":
+        for line in reroute(dry_run="--dry-run" in rest, force="--force" in rest):
+            print(line)
+    elif cmd == "_links":
+        print(json.dumps(peer_links()))
+    elif cmd == "top":
+        os.execv(sys.executable, [sys.executable, HOME + "/.local/bin/pool-top", *rest])
+    elif cmd == "tier":
+        if not rest:
+            die("which session? `pool` lists them")
+        if len(rest) > 1:
+            # "travel"/"stay" are clearer aliases for the internal "home"/"m1" tiers (travel Mac / stay Mac).
+            tier = {"travel": "home", "stay": "m1"}.get(rest[1], rest[1])
+            if tier not in TIER_NAMES + ("auto",):
+                die("tier is one of home (travel Mac), stay, float, or auto")
+            set_tier(rest[0], tier)
+        print(f"{rest[0][:8]}: %s (%s)" % tier_of(rest[0]))
+    elif cmd == "pin":
+        if not rest:
+            die("which session?")
+        PINS.parent.mkdir(parents=True, exist_ok=True)
+        with open(PINS, "a") as f:
+            f.write(rest[0][:8] + "\n")
+    elif cmd == "claude":
+        # Start a session on the Mac with more room. If that's the other Mac, open it there over ssh in this terminal
+        # (its tmux, so it can read the keychain); otherwise just start here.
+        d = cached_loads()
+        target = choose(d["loads"] if d else measure_both())
+        if target == SELF or SELF != M5:
+            os.execvp("claude", ["claude", *rest])
+        note(f"starting on {NAMES[PEER]}: {NAMES[SELF]} is busy")
+        if not desktop_tmux_on_peer():
+            os.execvp("claude", ["claude", *rest])
+        cwd = os.getcwd() if peer(f"test -d {q(os.getcwd())}")[0] == 0 else HOME
+        inner = PREAMBLE + f"cd {q(cwd)} && exec claude " + " ".join(q(a) for a in rest)
+        sys.exit(attach_there(f"pool-sh-claude", f"exec {POOL_TMUX} new -A -s pool-claude-{os.getpid()} -c {q(cwd)} {q(inner)}"))
+    elif cmd == "_measure":
+        print(json.dumps(measure()))
+    elif cmd == "_sync-json":
+        print(json.dumps(sync_sessions()))
+    elif cmd == "_flush":
+        sys.exit(0 if flush(rest[0]) else 3)
+    elif cmd == "tab":
+        args = [a for a in rest if a != "--show"]
+        show = "--show" in rest   # a move the user asked for: bring Ghostty forward so the reconnect is visible
+        if not args:
+            tab(own_session)
+        elif tab_move(args[0], show=show) or peer(f"pool _tab-move {q(args[0])}{' --show' if show else ''}")[0] == 0:
+            print(f"pool: moving session {args[0]}'s tab to the other Mac; its window stays and reconnects")
+        else:
+            die(f"session {args[0]} isn't open in a Ghostty tab on either Mac")
+    elif cmd == "_tab-there":
+        tab_there(int(rest[0]), rest[1], rest[2], rest[3], float(rest[4]) if len(rest) > 4 else 0,
+                  show=len(rest) > 5 and rest[5] == "1")
+    elif cmd == "_tab-move":
+        sys.exit(0 if tab_move([a for a in rest if a != "--show"][0], show="--show" in rest) else 1)
+    elif cmd == "_tab-candidates":
+        print(json.dumps(tab_candidates()))
+    elif cmd == "_tab-back":
+        tab_back(int(rest[0]), rest[1], rest[2], rest[3])
+    elif cmd == "_remote-claude":
+        remote_claude(rest[0], rest[1])
+    elif cmd == "_type":
+        sys.exit(0 if type_into(rest[0], rest[1]) else 1)
+    elif cmd == "home":
+        print(go_home("pool home"))
+    elif cmd == "service":
+        sys.exit(service(rest))
+    elif cmd == "_settle":
+        settle_conflicts(sync_sessions())
+    else:
+        die(f"unknown command {cmd!r}; see `pool --help`")
+
+
+if __name__ == "__main__":
+    main()
