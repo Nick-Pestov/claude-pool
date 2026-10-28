@@ -1,9 +1,14 @@
-# claude-pool - Stack PC Cores + RAMs for additional compute
-See what every Claude Code session costs on your Mac, and close what nobody is using.
+# claude-pool
 
-If you run several Claude Code sessions at once, it's hard to tell which ones are busy, how much memory they're
-holding, or what they've left running in the background. `claude-pool` shows all of that in one place and lets you
-reclaim what's idle — without losing any conversations.
+**Stack your Macs into one pool of cores and RAM — more compute and memory for Claude Code.**
+
+Claude Code is hungry: a few sessions at once fill up one Mac's CPU and memory fast. `claude-pool` lets you stack two
+Macs so your work draws on the combined cores and RAM of both. Any session can hop to whichever machine has the
+headroom — its window stays put, the compute moves — with files and conversations kept in sync and both Macs shown in
+one menu bar. Add an old laptop or a Mac mini and you've got more memory and more compute for Claude.
+
+- **Two Macs** → [stack them into a pool](#two-macs-the-pool) for more cores and RAM.
+- **One Mac** → `claude-pool` still shows what every session actually costs and closes what's idle (below).
 
 ![The claude-pool monitor](docs/monitor.png)
 
