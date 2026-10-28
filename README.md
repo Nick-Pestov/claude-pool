@@ -1,29 +1,14 @@
 # claude-pool
 
-How is works: https://claude.ai/artifact/VetSRGMidBzwsyreSXuiEp
-
 See what every Claude Code session costs on your Mac, and close what nobody is using.
 
 If you run several Claude Code sessions at once, it's hard to tell which ones are busy, how much memory they're
 holding, or what they've left running in the background. `claude-pool` shows all of that in one place and lets you
 reclaim what's idle — without losing any conversations.
 
-```
- claude-pool  M1 Pro · 17:06:14                                    x close · X close all idle · q quit
+![The claude-pool monitor](docs/monitor.png)
 
- CPU ████████░░░░░░░░░░░░░░░░░░░░   29% busy · 10 cores · load 17.2
- cores Perf ▄▃▂▂ ▂▁▁▁ Effi ▆▆
- RAM ████████████████████████░░░░  27.1/32 GB · swap 3.4 GB · ● memory ok (54% free)
-
-   session  name                                       state    CPU      RAM   idle
- › 1dc36b00 [Machine monitor] - Packaging for sharing  busy    0.05   1.0 GB    now
-   201d303d [Sales assistant] - Nit pass on PR 170     busy    0.02   237 MB    49m
-   7413cbde [Account notes] - Failed PR checks         idle    0.01   204 MB     1d
-
- Idle, nobody using it  · X closes all · select a session and press x
-  ✕ [Account notes] - Failed PR checks       idle 1d, 204 MB · conversation kept: claude attach 7413cbde
-  ✕ node apiserver.cjs, chrome-headless-shell  no session, running 2d, 118 MB · in ~/dev/app
-```
+*The monitor: per-core CPU and memory, every Claude Code session's real cost, and the idle sessions and leftover processes you can close.*
 
 ## What it shows
 
@@ -105,6 +90,10 @@ If you have a second Mac (an old laptop, a Mac mini at the office), the **two-Ma
 goes further: it moves Claude Code sessions between your two Macs for **more RAM and compute**, keeps a **shared
 filespace** so a session runs on either, prefers a **Thunderbolt cable** when plugged in (Wi-Fi otherwise), and shows
 both Macs in one menu bar. One Mac travels with you; the other stays put.
+
+![Both Macs in the menu bar](docs/menubar.png)
+
+*Both Macs in one menu bar: each one's CPU and memory, and the link between them (green = Thunderbolt cable, with the round-trip).*
 
 Set it up with [`two-mac/setup.sh`](two-mac/setup.sh) on both Macs, then follow the four steps in
 [`two-mac/SETUP.md`](two-mac/SETUP.md) (SSH, file sync, launchd — the parts that need both Macs and your sign-in).
