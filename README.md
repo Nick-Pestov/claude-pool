@@ -1,3 +1,4 @@
+<img width="374" height="163" alt="Screenshot 2026-10-28 at 6 40 57 PM" src="https://github.com/user-attachments/assets/b01e99e4-698b-43c5-9f68-4e97e4f09e09" />
 # claude-pool
 
 See what every Claude Code session costs on your Mac, and close what nobody is using.
@@ -83,6 +84,9 @@ Claude Code's own background machinery (the daemon, spare workers, PTY hosts), a
 anything matching a `protect` substring are never offered for closing.
 
 ---
+
+<img width="367" height="160" alt="Screenshot 2026-10-28 at 6 41 22 PM" src="https://github.com/user-attachments/assets/eb842512-e0de-4924-8c34-d8b689651003" />
+
 
 ## Two Macs: the pool
 
