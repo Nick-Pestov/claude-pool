@@ -216,6 +216,111 @@ def flush(path):
     return subprocess.run(["mutagen", "sync", "flush", name], capture_output=True, timeout=600).returncode == 0
 
 
+# A reconnect starts a fresh agent on the old Mac, and a fresh agent re-scans its whole folder and resends the list.
+# Every sync doing that at once (millions of files across them) pegged the old Mac on each cable pull and replug
+# (2026-10-29). So syncs reconnect one at a time, each once the one before has settled, smallest first.
+HOLD = STATE / "sync-hold.json"  # {"held": [names pool paused, next first], "at": when the last one came back}
+SETTLE_MAX = 600  # never wait longer than this on one sync before bringing back the next
+
+
+def pool_syncs(sessions):
+    """Every sync but the temporary seeding ones (named *-seed)."""
+    return [s for s in sessions if "-seed" not in s["name"]]
+
+
+def settling(s):
+    """Running but not yet back to watching: mid-cycle, or reconnecting and re-scanning after a reconnect."""
+    return not s.get("paused") and (s.get("status") != "watching" or not s["alpha"].get("connected")
+                                    or not s["beta"].get("connected"))
+
+
+def entries(s):
+    return (s["alpha"].get("files") or 0) + (s["alpha"].get("directories") or 0)
+
+
+def held_syncs():
+    try:
+        return json.loads(HOLD.read_text())
+    except (OSError, ValueError):
+        return {"held": [], "at": 0}
+
+
+def hold_syncs(sessions):
+    """Pause every pool sync that isn't already held, to bring them back one at a time (release_held). Returns the
+    names newly paused."""
+    state = held_syncs()
+    names = [s["name"] for s in sorted(pool_syncs(sessions), key=entries)
+             if s["name"] not in state["held"] and not s.get("paused")]
+    if names:
+        # Saved before pausing, so an interrupted pause still gets resumed by the daemon.
+        state["held"] = sorted(set(state["held"]) | set(names),
+                               key=lambda n: next((entries(s) for s in sessions if s["name"] == n), 0))
+        STATE.mkdir(parents=True, exist_ok=True)
+        HOLD.write_text(json.dumps(state))
+        subprocess.run(["mutagen", "sync", "pause", *names], capture_output=True, timeout=120)
+    return names
+
+
+def release_held(now=None):
+    """Resume the next sync pool paused, once no other sync is still settling (or the last one has had SETTLE_MAX).
+    The daemon calls this every pass, so a held sync always comes back. Returns what it did."""
+    state = held_syncs()
+    if not state["held"]:
+        return []
+    sessions = sync_sessions()
+    by = {s["name"]: s for s in sessions}
+    # A name that's gone or that someone resumed by hand is no longer ours to bring back.
+    held = [n for n in state["held"] if n in by and by[n].get("paused")]
+    now = now or time.time()
+    waiting = [s["name"] for s in pool_syncs(sessions) if s["name"] not in held and settling(s)]
+    if held and waiting and now - state.get("at", 0) < SETTLE_MAX:
+        if held != state["held"]:
+            HOLD.write_text(json.dumps({**state, "held": held}))
+        return []
+    done = []
+    if held:
+        name = held.pop(0)
+        subprocess.run(["mutagen", "sync", "resume", name], capture_output=True, timeout=120)
+        done.append(f"Mutagen sync {name} comes back" + (f" ({len(held)} more to follow, one at a time)" if held else ""))
+    HOLD.write_text(json.dumps({"held": held, "at": now}))
+    return done
+
+
+# The old Mac runs Mutagen's agents (its daemon and the M5's end of every sync run on the M5). Both run at lowered
+# priority so a re-scan yields to everything else on either Mac.
+SYNC_NICE = 10
+AGENT_WRAPPER = '#!/bin/sh\n# pool: start the agent at lower priority\nexec /usr/sbin/taskpolicy -c utility /usr/bin/nice -n {nice} {real} "$@"\n'
+
+
+def sync_priority():
+    """Wrap each Mutagen agent binary on this Mac so it starts at utility QoS and nice SYNC_NICE (the real binary
+    becomes mutagen-agent.bin; the handshake Mutagen checks is unchanged, so it doesn't reinstall), and renice agents
+    and the daemon already running. Re-run every few minutes, so a new Mutagen version's agent is wrapped too."""
+    done = []
+    for path in Path(HOME, ".mutagen/agents").glob("*/mutagen-agent"):
+        with open(path, "rb") as f:
+            if f.read(2) == b"#!":
+                continue
+        real = path.with_name("mutagen-agent.bin")
+        tmp = path.with_name(".mutagen-agent.wrapper")
+        if real.exists():
+            real.unlink()
+        os.link(path, real)
+        tmp.write_text(AGENT_WRAPPER.format(nice=SYNC_NICE, real=q(str(real))))
+        tmp.chmod(0o755)
+        os.replace(tmp, path)  # atomic: a reconnect never finds the path missing
+        done.append(f"Mutagen agent {path.parent.name} now starts at lower priority")
+    out = subprocess.run(["ps", "-axo", "pid=,nice=,args="], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        f = line.split(None, 2)
+        if len(f) == 3 and f[0].isdigit() and int(f[1]) < SYNC_NICE and (
+                re.match(r"(\S*/)?\.mutagen/agents/\S+/mutagen-agent(\.bin)? synchronizer", f[2])  # not ssh's command line
+                or re.match(r"\S*/mutagen daemon run$", f[2])):
+            subprocess.run(["renice", str(SYNC_NICE), "-p", f[0]], capture_output=True)
+            done.append(f"reniced {f[2].split()[0].rsplit('/', 1)[-1]} {f[0]}")
+    return done
+
+
 # --- running commands ---
 
 def parts(line):
@@ -1075,13 +1180,14 @@ def peer_links(ps_out=None):
     return links
 
 
-def reroute(dry_run=False, links=None, cable=None, plugged=None, now=None, force=False):
+def reroute(dry_run=False, links=None, cable=None, plugged=None, now=None, force=False, sessions=None):
     """Put this Mac's connections to the other Mac on the right route: onto the cable when it's plugged in and the
     other Mac answers there, back to Wi-Fi straight away when it's pulled (connections on a pulled cable are dead, and
-    ssh's keepalives would take ~15 s to notice). Mutagen's syncs reconnect with a pause and resume (on the M5, where
-    its daemon runs); pool's windows and streams drop their ssh and reconnect by themselves (a window blanks for a
-    second; the session in it keeps running); the shared ssh connection is retired (a dead one ended). Your own ssh
-    sessions are left alone. Returns what it did (or would do)."""
+    ssh's keepalives would take ~15 s to notice). Mutagen's syncs (on the M5, where its daemon runs) move one at a
+    time: onto the cable by dropping one sync's connection once no sync is still settling; off a pulled cable by
+    pausing them all and bringing them back one by one (release_held). Pool's windows and streams drop their ssh and
+    reconnect by themselves (a window blanks for a second; the session in it keeps running); the shared ssh connection
+    is retired (a dead one ended). Your own ssh sessions are left alone. Returns what it did (or would do)."""
     links = peer_links() if links is None else links
     plugged = cable_plugged() if plugged is None else plugged
     every = links
@@ -1113,19 +1219,46 @@ def reroute(dry_run=False, links=None, cable=None, plugged=None, now=None, force
         if not dry_run:
             subprocess.run(["ssh", "-O", "stop" if target == "cable" else "exit", ALIAS[PEER]], capture_output=True, timeout=10)
             mark("master")
-    # Mutagen's syncs, pool's windows and streams: drop the connection and each comes back by itself over peer-route,
-    # so on the right route (Mutagen reconnects in under a second; a sync never gets left paused, as a pause and resume
-    # interrupted half way did on 2026-10-28). Mutagen's ssh runs on the M5, where its daemon is.
+    # Pool's windows and streams: drop the connection and each comes back by itself over peer-route, so on the right
+    # route.
+    def drop(l):
+        try:
+            os.kill(l["ssh"], signal.SIGTERM)
+        except OSError:
+            pass
+
     for l in links:
         key = f"{l['kind']}:{l['ssh']}"
-        movable = l["kind"] in ("window", "stream") or (l["kind"] == "mutagen" and SELF == M5)
-        if movable and due(key):
-            done.append(f"{'Mutagen sync' if l['kind'] == 'mutagen' else 'pool ' + l['kind']} (ssh {l['ssh']}) reconnects over the {target}")
+        if l["kind"] in ("window", "stream") and due(key):
+            done.append(f"pool {l['kind']} (ssh {l['ssh']}) reconnects over the {target}")
             if not dry_run:
-                try:
-                    os.kill(l["ssh"], signal.SIGTERM)
-                except OSError:
-                    pass
+                drop(l)
+                mark(key)
+    # Mutagen's syncs, one at a time (see HOLD). Mutagen's ssh runs on the M5, where its daemon is.
+    syncs = [l for l in links if l["kind"] == "mutagen"] if SELF == M5 else []
+    if syncs and target == "Wi-Fi" and due("syncs"):
+        # Their connections are dead and ssh would notice within ~15 s, then Mutagen would bring every sync back at
+        # once. Paused first, then the dead connections dropped, then back one by one. The held list is saved before
+        # the pause, and the daemon resumes from it every pass, so no sync is left paused (as an interrupted pause and
+        # resume did on 2026-10-28).
+        done.append(f"Mutagen's syncs ({len(syncs)} on the pulled cable) pause and come back over the Wi-Fi one at a time")
+        if not dry_run:
+            hold_syncs(sync_sessions() if sessions is None else sessions)
+            for l in syncs:
+                drop(l)
+            mark("syncs")
+            done += release_held(now=now)
+    elif syncs and target == "cable" and not held_syncs()["held"]:
+        # Onto the cable: the syncs on Wi-Fi still work, so they keep running there while one moves at a time, each
+        # once nothing is still settling from the last.
+        l = syncs[0]
+        key = f"mutagen:{l['ssh']}"
+        if due(key) and not any(settling(s) for s in pool_syncs(sync_sessions() if sessions is None else sessions)):
+            more = len(syncs) - 1
+            done.append(f"Mutagen sync (ssh {l['ssh']}) reconnects over the cable"
+                        + (f" ({more} more to follow, one at a time)" if more else ""))
+            if not dry_run:
+                drop(l)
                 mark(key)
     if done and not dry_run:
         STATE.mkdir(parents=True, exist_ok=True)
@@ -1359,6 +1492,16 @@ def daemon():
         except Exception as e:
             log(f"daemon reroute failed: {e!r}")
         try:
+            done = release_held()
+            if done:
+                log("link: " + "; ".join(done))
+            # Every few minutes, so a restarted Mutagen daemon or a new agent version runs at lowered priority too.
+            if cycle % 20 == 1:
+                for line in sync_priority() + peer("pool _sync-priority", timeout=60)[1].splitlines():
+                    log("sync priority: " + line)
+        except Exception as e:
+            log(f"daemon sync release failed: {e!r}")
+        try:
             # Leaving the office: a minute with the old Mac out of reach opens windows here for what runs here
             # (windows showing old-Mac sessions take those over by themselves); back in reach, its stale copies
             # stop. Unplugging the cable isn't a signal: it comes out for display rearranging too.
@@ -1422,8 +1565,10 @@ def watch(once=False):
                 out.append(f"{NAMES[h]:12} {bar(m):36} {busy(m):>5.0%}   load {m['load1']:>5.1f} / {m['cores']:<3}"
                            f" memory free {m['mem_free']:>3}%   sessions {len(ss)} ({working} working)")
             sessions = sync_sessions()
-            bad = [s["name"] for s in sessions if not healthy(s)]
-            out += ["", f"sync: {len(sessions)} folders, " + (f"needs a look: {', '.join(bad)}" if bad else "all in step"),
+            held = set(held_syncs()["held"]) if SELF == M5 else set()
+            bad = [s["name"] for s in sessions if not healthy(s) and s["name"] not in held]
+            out += ["", f"sync: {len(sessions)} folders, " + (f"needs a look: {', '.join(bad)}" if bad else "all in step")
+                    + (f"; coming back one at a time: {', '.join(sorted(held))}" if held else ""),
                     "", "recent (moves, commands sent to the other Mac, sync conflicts):"]
             out += [f"  {t[11:]} {who:>3}  {msg[:110]}" for t, who, msg in recent()] or ["  nothing yet"]
             print("\033[H\033[2J" + "\n".join(out) if not once else "\n".join(out), flush=True)
@@ -1453,11 +1598,13 @@ def status():
         print(line)
     print("room = idle capacity in old-Mac cores (an M5 core is about 1.8 of them)")
     sessions = sync_sessions()
-    bad = [s for s in sessions if not healthy(s) and "-seed" not in s["name"]]
+    held = set(held_syncs()["held"]) if SELF == M5 else set()
+    bad = [s for s in sessions if not healthy(s) and "-seed" not in s["name"] and s["name"] not in held]
     seeding = [s["name"] for s in sessions if "-seed" in s["name"]]
     print(f"sync: {len(sessions) - len(seeding)} folders live" + (f", {len(bad)} need attention: "
           + ", ".join(f"{s['name']} ({s.get('status')})" for s in bad) if bad else ", all in step")
-          + (f"; seeding {', '.join(seeding)}" if seeding else ""))
+          + (f"; seeding {', '.join(seeding)}" if seeding else "")
+          + (f"; after a reconnect, coming back one at a time: {', '.join(sorted(held))}" if held else ""))
 
 
 def local_sessions():
@@ -1511,6 +1658,9 @@ def main():
         route_status()
     elif cmd == "_reroute":
         for line in reroute(dry_run="--dry-run" in rest, force="--force" in rest):
+            print(line)
+    elif cmd == "_sync-priority":
+        for line in sync_priority():
             print(line)
     elif cmd == "_links":
         print(json.dumps(peer_links()))
