@@ -65,6 +65,12 @@ Run that **on the travel Mac** (its Mutagen daemon drives the sync). `mutagen sy
 `mutagen daemon start` after a reboot. Keep build output and caches in the ignores — syncing them is most of the
 cost. Don't work in the same checkout from both Macs at once.
 
+When the cable is plugged in or pulled, the pool daemon moves the syncs to the new route **one at a time**: each
+reconnect starts a fresh Mutagen agent on the stay Mac, which re-scans its whole folder, and doing them all at once
+can peg that Mac. On a pull the syncs are paused and come back smallest first, each once the previous one has
+settled; `pool` shows which are still waiting. Mutagen's agents (stay Mac) and daemon (travel Mac) also run at
+lowered priority, so a re-scan gives way to your own work.
+
 ## 3. Background agents (launchd)
 
 On the **travel Mac**, keep the pool daemon running (it measures both Macs, rebalances, and settles sync conflicts).
